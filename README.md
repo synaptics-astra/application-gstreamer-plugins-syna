@@ -1,1 +1,0 @@
-# application-gstreamer-plugins-syna
