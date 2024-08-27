@@ -27,6 +27,8 @@
 #include "synap/label_info.hpp"
 #include "synapmeta.h"
 
+#include <queue>
+
 using namespace std;
 using namespace synaptics::synap;
 
@@ -41,6 +43,15 @@ G_BEGIN_DECLS
 typedef struct _GstSynapOverlay GstSynapOverlay;
 typedef struct _GstSynapOverlayClass GstSynapOverlayClass;
 
+struct MetaQueue {
+  gpointer overlaydata;
+  GstSynapPostProcessingMode mode;
+  gint width;
+  gint height;
+  gfloat confthreshold;
+  GstClockTime pts;
+};
+
 struct _GstSynapOverlay
 {
   GstBaseTransform base_synapoverlay;
@@ -52,11 +63,8 @@ struct _GstSynapOverlay
   gchar* label;
 
   GstVideoInfo videoinfo;
-  GstSynapPostProcessingMode mode;
-  gpointer overlaydata;
-  gint width;
-  gint height;
-  gfloat confthreshold;
+  MetaQueue metaQueue;
+  queue<MetaQueue> queue;
 
   /* SyNAP */
   LabelInfo *labelinfo;

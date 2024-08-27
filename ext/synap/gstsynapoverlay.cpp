@@ -70,6 +70,11 @@ static GstFlowReturn
 gst_synap_overlay_inference_sink_chain (GstPad * pad, GstObject * parent,
     GstBuffer * buffer);
 
+static void pushMetaQueue (GstSynapOverlay *synapoverlay,
+    GstSynapMeta *meta, GstClockTime pts);
+static MetaQueue popMetaQueue (GstSynapOverlay *synapoverlay,
+    GstClockTime pts);
+
 enum
 {
   PROP_0,
@@ -164,8 +169,9 @@ gst_synap_overlay_init (GstSynapOverlay * synapoverlay)
   gst_pad_set_active (synapoverlay->inference_pad, TRUE);
 
   /* Initialize parameters */
-  synapoverlay->overlaydata = NULL;
+  synapoverlay->metaQueue.overlaydata = NULL;
   synapoverlay->label = NULL;
+  synapoverlay->queue = queue<MetaQueue>();
 }
 
 void
@@ -279,6 +285,20 @@ gst_synap_overlay_stop (GstBaseTransform * trans)
   GST_DEBUG_OBJECT (synapoverlay, "stop");
   if (synapoverlay->labelinfo != NULL)
     delete synapoverlay->labelinfo;
+  g_mutex_lock (&synapoverlay->data_lock);
+  while (!synapoverlay->queue.empty()) {
+    MetaQueue metaQueue = synapoverlay->queue.front();
+    if (metaQueue.overlaydata != NULL) {
+      if (metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER)
+        delete ((Classifier::Result*)metaQueue.overlaydata);
+      else if (metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR)
+        delete ((Detector::Result*)metaQueue.overlaydata);
+      else
+        GST_ERROR ("Invalid mode - Should not reach here");
+    }
+    synapoverlay->queue.pop();
+  }
+  g_mutex_unlock (&synapoverlay->data_lock);
   return TRUE;
 }
 
@@ -290,7 +310,13 @@ gst_synap_overlay_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   GST_DEBUG_OBJECT (synapoverlay, "transform_ip");
 
   buf = gst_buffer_make_writable (buf);
-  if (synapoverlay->overlaydata != NULL) {
+  g_mutex_lock (&synapoverlay->data_lock);
+  MetaQueue metaQueue = popMetaQueue (synapoverlay, buf->pts);
+  if (metaQueue.overlaydata != NULL) {
+    synapoverlay->metaQueue = metaQueue;
+  }
+  g_mutex_unlock (&synapoverlay->data_lock);
+  if (synapoverlay->metaQueue.overlaydata != NULL) {
     gst_synap_overlay_render (trans, buf);
   }
   return GST_FLOW_OK;
@@ -304,24 +330,49 @@ gst_synap_overlay_inference_sink_chain (GstPad * pad, GstObject * parent,
 
   GST_DEBUG_OBJECT (synapoverlay, "inference_sink_chain");
   GstSynapMeta *meta = gst_buffer_get_synap_meta (buffer);
+
+  g_mutex_lock (&synapoverlay->data_lock);
   if (meta != NULL && meta->data != NULL) {
-    /* Clear existing one */
-    g_mutex_lock (&synapoverlay->data_lock);
-    if (synapoverlay->overlaydata != NULL) {
-      if (synapoverlay->mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER)
-        delete ((Classifier::Result*)synapoverlay->overlaydata);
-      else if (synapoverlay->mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR)
-        delete ((Detector::Result*)synapoverlay->overlaydata);
-      else
-        GST_ERROR ("Invalid mode - Should not reach here");
-    }
-    synapoverlay->overlaydata = meta->data;
-    synapoverlay->mode = meta->postproc_mode;
-    synapoverlay->width = meta->width;
-    synapoverlay->height = meta->height;
-    synapoverlay->confthreshold = meta->confthreshold;
-    g_mutex_unlock (&synapoverlay->data_lock);
+    pushMetaQueue (synapoverlay, meta, buffer->pts);
   }
+  g_mutex_unlock (&synapoverlay->data_lock);
   gst_clear_buffer (&buffer);
   return GST_FLOW_OK;
+}
+
+static void
+pushMetaQueue (GstSynapOverlay *synapoverlay,
+    GstSynapMeta *meta, GstClockTime pts)
+{
+  MetaQueue metaQueue;
+  metaQueue.overlaydata = meta->data;
+  metaQueue.mode = meta->postproc_mode;
+  metaQueue.width = meta->width;
+  metaQueue.height = meta->height;
+  metaQueue.confthreshold = meta->confthreshold;
+  metaQueue.pts = pts;
+  synapoverlay->queue.push(metaQueue);
+}
+
+static MetaQueue
+popMetaQueue (GstSynapOverlay *synapoverlay, GstClockTime pts)
+{
+  while (!synapoverlay->queue.empty()) {
+    MetaQueue metaQueue = synapoverlay->queue.front();
+    if (synapoverlay->queue.size() == 1 || pts <= metaQueue.pts) {
+      GST_DEBUG ("Ret.PTS = [%lu] Inc.PTS = [%lu]", metaQueue.pts, pts);
+      return metaQueue;
+    } else if (pts > metaQueue.pts) {
+      if (metaQueue.overlaydata != NULL) {
+        if (metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER)
+          delete ((Classifier::Result*)metaQueue.overlaydata);
+        else if (metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR)
+          delete ((Detector::Result*)metaQueue.overlaydata);
+        else
+          GST_ERROR ("Invalid mode - Should not reach here");
+      }
+      synapoverlay->queue.pop();
+    }
+  }
+  return MetaQueue{NULL, GST_SYNAP_POSTPROCESSING_MODE_NONE, NULL, NULL, NULL};
 }

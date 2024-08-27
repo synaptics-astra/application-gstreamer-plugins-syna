@@ -63,10 +63,10 @@ gst_synap_overlay_render_classification (GstSynapOverlay * synapoverlay,
   }
 
   g_mutex_lock (&synapoverlay->data_lock);
-  Classifier::Result * result = (Classifier::Result *) synapoverlay->overlaydata;
+  Classifier::Result * result = (Classifier::Result *) synapoverlay->metaQueue.overlaydata;
   g_return_val_if_fail (result != NULL, FALSE);
 
-  if (result->items[0].confidence > synapoverlay->confthreshold) {
+  if (result->items[0].confidence > synapoverlay->metaQueue.confthreshold) {
     if (synapoverlay->label != NULL) {
       cairo_select_font_face (cr, "Sans", CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
       cairo_set_font_size (cr, 35.0);
@@ -100,11 +100,11 @@ gst_synap_overlay_render_poseline (GstSynapOverlay *synapoverlay, GstVideoFrame 
 
   if ((landmarks[start].visibility > GST_SYNAP_POSE_VISIBILITY_THRESHOLD) &&
        (landmarks[end].visibility > GST_SYNAP_POSE_VISIBILITY_THRESHOLD)) {
-    xs = landmarks[start].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->width;
-    ys = landmarks[start].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->height;
+    xs = landmarks[start].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->metaQueue.width;
+    ys = landmarks[start].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->metaQueue.height;
 
-    xe = landmarks[end].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->width;
-    ye = landmarks[end].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->height;
+    xe = landmarks[end].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->metaQueue.width;
+    ye = landmarks[end].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->metaQueue.height;
 
     cairo_move_to (cr, xs, ys);
     cairo_line_to (cr, xe, ye);
@@ -144,7 +144,7 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
   }
 
   g_mutex_lock (&synapoverlay->data_lock);
-  Detector::Result * result = (Detector::Result *) synapoverlay->overlaydata;
+  Detector::Result * result = (Detector::Result *) synapoverlay->metaQueue.overlaydata;
   g_return_val_if_fail (result != NULL, FALSE);
 
   gdouble x, y, width, height;
@@ -202,8 +202,8 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
       /* dot */
       for (size_t j = 0; j < GST_SYNAP_POSE_SIZE; ++j) {
         if (result->items[i].landmarks[j].visibility > GST_SYNAP_POSE_VISIBILITY_THRESHOLD) {
-          x = result->items[i].landmarks[j].x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->width;
-          y = result->items[i].landmarks[j].y * GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->height;
+          x = result->items[i].landmarks[j].x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->metaQueue.width;
+          y = result->items[i].landmarks[j].y * GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->metaQueue.height;
           cairo_arc (cr, x, y, 3, 0, 2 * M_PI);
           cairo_fill (cr);
         }
@@ -211,13 +211,13 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
     }
     else {
     x = result->items[i].bounding_box.origin.x *
-        GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->width;
+        GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->metaQueue.width;
     y = result->items[i].bounding_box.origin.y *
-        GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->height;
+        GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->metaQueue.height;
     width =
-        result->items[i].bounding_box.size.x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->width;
+        result->items[i].bounding_box.size.x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->metaQueue.width;
     height =
-        result->items[i].bounding_box.size.y * GST_VIDEO_FRAME_HEIGHT (&frame) /synapoverlay->height;
+        result->items[i].bounding_box.size.y * GST_VIDEO_FRAME_HEIGHT (&frame) /synapoverlay->metaQueue.height;
 
     /* draw rectangle */
     cairo_rectangle (cr, x, y, width, height);
@@ -280,9 +280,9 @@ gst_synap_overlay_render (GstBaseTransform * trans, GstBuffer * buffer)
     }
   }
 
-  if (synapoverlay->mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER) {
+  if (synapoverlay->metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER) {
     ret = gst_synap_overlay_render_classification (synapoverlay, buffer, format);
-  } else if (synapoverlay->mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
+  } else if (synapoverlay->metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
     ret = gst_synap_overlay_render_detection (synapoverlay, buffer, format);
   }
 
