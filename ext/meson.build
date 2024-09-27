@@ -1,3 +1,3 @@
-foreach plugin : ['synap']
+foreach plugin : ['synap','synavideoconvertscale']
     subdir(plugin)
 endforeach
