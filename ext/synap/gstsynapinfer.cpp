@@ -87,6 +87,7 @@ enum
   PROP_CONFIDENCE_THRESHOLD,
   PROP_NUM_INFERENCE,
   PROP_FRAME_INTERVAL,
+  PROP_INFER_STATISTICS,
 };
 
 #define GST_SYNAP_DEFAULT_INFERENCE_CLASSIFIER  (2)
@@ -178,6 +179,10 @@ gst_synap_infer_class_init (GstSynapInferClass * klass)
       g_param_spec_int ("frameinterval", "FrameInterval", "Frame Interval", 0,
           G_MAXINT, 0,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+   g_object_class_install_property (gobject_class, PROP_INFER_STATISTICS,
+      g_param_spec_boolean ("inferstatistics", "Synap Inference Statistics",
+        "Enable logging statistics", FALSE, G_PARAM_READWRITE));
 }
 
 static void
@@ -198,6 +203,9 @@ gst_synap_infer_init (GstSynapInfer * synapinfer)
   synapinfer->confthreshold = -1;
   synapinfer->output = NULL;
   synapinfer->outputmode = GST_SYNAP_OUTPUT_MODE_OVERLAY;
+  synapinfer->infer_statistics_flag = FALSE;
+  synapinfer->total_infer_time = 0;
+  synapinfer->infer_count = 0;
 }
 
 void
@@ -260,6 +268,13 @@ gst_synap_infer_set_property (GObject * object, guint property_id,
     }
     break;
 
+    case PROP_INFER_STATISTICS:
+    {
+      synapinfer->infer_statistics_flag = g_value_get_boolean(value);
+      GST_INFO("Inference statistics: %d", synapinfer->infer_statistics_flag);
+    }
+    break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -310,6 +325,12 @@ gst_synap_infer_get_property (GObject * object, guint property_id,
     case PROP_FRAME_INTERVAL:
     {
       g_value_set_int (value, synapinfer->frame_interval);
+    }
+    break;
+
+    case PROP_INFER_STATISTICS:
+    {
+      g_value_set_boolean (value, synapinfer->infer_statistics_flag);
     }
     break;
 
@@ -434,6 +455,12 @@ gst_synap_infer_stop (GstBaseTransform * trans)
   g_return_val_if_fail (synapinfer != NULL, FALSE);
   g_return_val_if_fail (GST_IS_SYNAP_INFER (synapinfer), FALSE);
 
+  if (synapinfer->infer_statistics_flag && synapinfer->infer_count > 0) {
+    GstClockTime avg_infer_time_ns = synapinfer->total_infer_time / synapinfer->infer_count;
+    double avg_infer_time_ms = (double) avg_infer_time_ns / 1000000.0;
+    g_print("Average Inference Time: %.3f ms\n", avg_infer_time_ms);
+  }
+
   if (synapinfer->network != NULL)
     delete synapinfer->network;
   if (synapinfer->preprocessor != NULL)
@@ -485,6 +512,13 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     GST_ERROR ("Error assigning input to tensor");
     return GST_FLOW_ERROR;
   }
+
+  /* Track time for inference */
+  GstClockTime start_time;
+  if (synapinfer->infer_statistics_flag) {
+    start_time = gst_clock_get_time(gst_element_get_clock(GST_ELEMENT(synapinfer)));
+  }
+
   /* Execute inference */
   if (!synapinfer->network->predict ()) {
     gst_buffer_unmap (buf, &map);
@@ -492,6 +526,12 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     return GST_FLOW_ERROR;
   }
   gst_buffer_unmap (buf, &map);
+
+  /* Calculate inference time */
+  if (synapinfer->infer_statistics_flag) {
+    synapinfer->total_infer_time += (gst_clock_get_time(gst_element_get_clock(GST_ELEMENT(synapinfer))) - start_time);
+    synapinfer->infer_count++;
+  }
 
   /* Post Process output */
   gboolean postproc_result = FALSE;

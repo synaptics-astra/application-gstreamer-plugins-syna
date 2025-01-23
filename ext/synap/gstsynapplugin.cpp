@@ -23,6 +23,7 @@
 
 #include "gstsynapinfer.h"
 #include "gstsynapoverlay.h"
+#include "gstsynapimageproc.h"
 
 
 static gboolean
@@ -32,6 +33,7 @@ plugin_init (GstPlugin * plugin)
 
   ret |= GST_ELEMENT_REGISTER (synapinfer, plugin);
   ret |= GST_ELEMENT_REGISTER (synapoverlay, plugin);
+  ret |= GST_ELEMENT_REGISTER (synapimageproc, plugin);
   return ret;
 }
 

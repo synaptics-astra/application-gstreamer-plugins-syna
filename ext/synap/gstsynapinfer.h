@@ -69,6 +69,11 @@ struct _GstSynapInfer
   GstSynapPostProcessingMode postproc_mode;
   GstSynapOutputMode outputmode;
 
+  /* Synap infer statistics */
+  gboolean infer_statistics_flag; /* Add flag to handle infer statistics  */
+  GstClockTime total_infer_time;  /* Store total inference time           */
+  guint infer_count;              /* store the inference count            */
+
   /* SyNAP */
   Network *network;
   Preprocessor *preprocessor;

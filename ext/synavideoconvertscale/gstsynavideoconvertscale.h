@@ -47,6 +47,12 @@ struct _GstSynaVideoConvertScale
 
   gint out_width, out_height;
   int out_cv_type;
+
+  cv::UMat tmp1;
+  cv::UMat tmp2;
+
+  cv::UMat cvUInFrame;
+  cv::UMat cvUOutFrame;
 };
 
 struct _GstSynaVideoConvertScaleClass

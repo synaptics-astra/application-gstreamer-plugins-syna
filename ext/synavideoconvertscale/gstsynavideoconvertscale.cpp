@@ -42,6 +42,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/imgproc.hpp>
+#include "opencv2/core/ocl.hpp"
 
 GST_DEBUG_CATEGORY_STATIC (gst_syna_video_convert_scale_debug_category);
 #define GST_CAT_DEFAULT gst_syna_video_convert_scale_debug_category
@@ -79,8 +80,10 @@ static gboolean gst_syna_video_convert_scale_cvmat_params_from_video_info
     GError ** err);
 static gboolean gst_syna_video_convert_scale_cvimage_type_from_video_format
     (GstVideoFormat format, int *cv_type, GError ** err);
-static void gst_syna_video_convert_scale_YV12ToNV12 (const cv::Mat & input,
-    cv::Mat & output);
+static void gst_syna_video_convert_scale_YV12ToNV12 (const cv::UMat & input,
+    cv::UMat & output);
+static void gst_syna_video_convert_scale_YV444TOYUY2(const cv::UMat &input,
+                                                     cv::UMat &output);
 
 enum
 {
@@ -93,14 +96,14 @@ static GstStaticPadTemplate gst_syna_video_convert_scale_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB, BGRA, NV12 }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB, BGRA, NV12, I420, YUY2}"))
     );
 
 static GstStaticPadTemplate gst_syna_video_convert_scale_sink_template =
 GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB, BGRA, NV12 }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB, BGRA, NV12, I420, YUY2}"))
     );
 
 
@@ -161,6 +164,7 @@ static void
 gst_syna_video_convert_scale_init (GstSynaVideoConvertScale *
     synavideoconvertscale)
 {
+  cv::ocl::setUseOpenCL(true);
 }
 
 void
@@ -377,16 +381,19 @@ gst_syna_video_convert_scale_set_caps (GstBaseTransform * trans,
     synavideoconvertscale->cvImage.create (cv::Size (synavideoconvertscale->
             in_width, synavideoconvertscale->in_height), CV_8UC3);
   } else if (input_format == GST_VIDEO_FORMAT_BGRA) {
-    // BGRA/ARGB: Width x Height with 4 channels
+    // BGRA: Width x Height with 4 channels
     synavideoconvertscale->cvImage.create (cv::Size (synavideoconvertscale->
             in_width, synavideoconvertscale->in_height), CV_8UC4);
-  } else if (input_format == GST_VIDEO_FORMAT_NV12) {
+  } else if (input_format == GST_VIDEO_FORMAT_NV12 || input_format == GST_VIDEO_FORMAT_I420) {
     // NV12 and I420: Single channel with height * 3/2
     synavideoconvertscale->cvImage.create (cv::Size (synavideoconvertscale->
             in_width, synavideoconvertscale->in_height * 3 / 2), CV_8UC1);
+  } else if (input_format == GST_VIDEO_FORMAT_YUY2) {
+    // YUY2 is interleaved, width x height with 2 channels
+    synavideoconvertscale->cvImage.create(cv::Size(synavideoconvertscale->in_width, synavideoconvertscale->in_height), CV_8UC2);
   } else {
     // Unsupported format
-    g_warning ("Unsupported input format for synavideoconvertscale plugin: %d",
+    GST_WARNING_OBJECT (trans, "Unsupported input format for synavideoconvertscale plugin: %d",
         input_format);
     return FALSE;
   }
@@ -397,16 +404,19 @@ gst_syna_video_convert_scale_set_caps (GstBaseTransform * trans,
     synavideoconvertscale->cvOutImage.create (cv::Size (synavideoconvertscale->
             out_width, synavideoconvertscale->out_height), CV_8UC3);
   } else if (output_format == GST_VIDEO_FORMAT_BGRA) {
-    // BGRA/ARGB: Width x Height with 4 channels
+    // BGRA: Width x Height with 4 channels
     synavideoconvertscale->cvOutImage.create (cv::Size (synavideoconvertscale->
             out_width, synavideoconvertscale->out_height), CV_8UC4);
-  } else if (output_format == GST_VIDEO_FORMAT_NV12) {
+  } else if (output_format == GST_VIDEO_FORMAT_NV12 || output_format == GST_VIDEO_FORMAT_I420) {
     // NV12: Similar to I420, with width x height * 3/2
     synavideoconvertscale->cvOutImage.create (cv::Size (synavideoconvertscale->
             out_width, synavideoconvertscale->out_height * 3 / 2), CV_8UC1);
+  } else if (output_format == GST_VIDEO_FORMAT_YUY2) {
+    // YUY2 is interleaved, width x height with 2 channels
+    synavideoconvertscale->cvOutImage.create(cv::Size(synavideoconvertscale->in_width, synavideoconvertscale->in_height), CV_8UC2);
   } else {
     // Unsupported output format
-    g_warning ("Unsupported output format for synavideoconvertscale plugin: %d",
+    GST_WARNING_OBJECT (trans, "Unsupported output format for synavideoconvertscale plugin: %d",
         output_format);
     return FALSE;
   }
@@ -524,102 +534,485 @@ gst_syna_video_convert_scale_transform (GstBaseTransform * trans,
       (synavideoconvertscale->in_width != synavideoconvertscale->out_width)
       || (synavideoconvertscale->in_height !=
       synavideoconvertscale->out_height);
-  gboolean resize_handled = false;
 
-  cv::Mat tmp1;
-  cv::Mat tmp2;
+  synavideoconvertscale->cvImage.copyTo(synavideoconvertscale->cvUInFrame);
+
+  synavideoconvertscale->tmp1 =
+      cv::UMat(cv::Size(synavideoconvertscale->in_width, synavideoconvertscale->in_height), output_format, cv::USAGE_ALLOCATE_DEVICE_MEMORY);
+  synavideoconvertscale->cvUOutFrame =
+      cv::UMat(cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), output_format, cv::USAGE_ALLOCATE_DEVICE_MEMORY);
 
   if (input_format == output_format) {
     if (input_format == GST_VIDEO_FORMAT_NV12) {
       // Check for resize
-      if (resize_reqd) {
-        cv::cvtColor (synavideoconvertscale->cvImage, tmp1,
-            cv::COLOR_YUV2BGRA_NV12);
-        cv::resize (tmp1, tmp2, cv::Size (synavideoconvertscale->out_width,
-                synavideoconvertscale->out_height), cv::INTER_AREA);
-        cv::Mat yv12_image;
-        cv::cvtColor (tmp2, yv12_image, cv::COLOR_BGRA2YUV_YV12);
-        gst_syna_video_convert_scale_YV12ToNV12 (yv12_image,
-            synavideoconvertscale->cvOutImage);
-      } else {
-        synavideoconvertscale->cvImage.copyTo (synavideoconvertscale->
-            cvOutImage);
+      if (resize_reqd)
+      {
+        cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2BGRA_NV12);
+        cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                   cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+        cv::UMat yv12_image;
+        cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_BGRA2YUV_YV12);
+        gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+        synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
       }
-      resize_handled = true;
-    } else {
-      synavideoconvertscale->cvImage.copyTo (tmp1);
-    }
-  } else {
-    if (input_format == GST_VIDEO_FORMAT_NV12) {
-      if (output_format == GST_VIDEO_FORMAT_BGRA) {
-        cv::cvtColor (synavideoconvertscale->cvImage, tmp1,
-            cv::COLOR_YUV2BGRA_NV12);
-      }
-      else if (output_format == GST_VIDEO_FORMAT_RGB) {
-        cv::cvtColor (synavideoconvertscale->cvImage, tmp1,
-            cv::COLOR_YUV2RGB_NV12);
+      else
+      {
+        synavideoconvertscale->cvUInFrame.copyTo(synavideoconvertscale->cvOutImage);
       }
     }
-    else if (input_format == GST_VIDEO_FORMAT_BGRA) {
-      if (output_format == GST_VIDEO_FORMAT_RGB) {
-        cv::cvtColor (synavideoconvertscale->cvImage, tmp1, cv::COLOR_BGRA2RGB);
+
+    else if (input_format == GST_VIDEO_FORMAT_YUY2)
+    {
+      if (resize_reqd)
+      {
+        cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_YUY2);
+        cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                   cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+        cv::UMat yuv_image;
+        cv::cvtColor(synavideoconvertscale->tmp1, yuv_image, cv::COLOR_RGB2YUV);
+        gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+        synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
       }
-      else if (output_format == GST_VIDEO_FORMAT_NV12) {
-        if (resize_reqd) {
-          cv::resize (synavideoconvertscale->cvImage, tmp2,
-              cv::Size (synavideoconvertscale->out_width,
-                  synavideoconvertscale->out_height), cv::INTER_AREA);
-        }
-        else {
-          synavideoconvertscale->cvImage.copyTo (tmp2);
-        }
-        resize_handled = true;
-        cv::Mat yv12_image;
-        cv::cvtColor (tmp2, yv12_image, cv::COLOR_BGRA2YUV_YV12);
-        gst_syna_video_convert_scale_YV12ToNV12 (yv12_image,
-            synavideoconvertscale->cvOutImage);
+      else
+      {
+        synavideoconvertscale->cvUInFrame.copyTo(synavideoconvertscale->cvOutImage);
       }
     }
-    else if (input_format == GST_VIDEO_FORMAT_RGB) {
-      if (output_format == GST_VIDEO_FORMAT_BGRA) {
-        cv::cvtColor (synavideoconvertscale->cvImage, tmp1, cv::COLOR_RGB2BGRA);
+    else if (input_format == GST_VIDEO_FORMAT_I420)
+    {
+      if (resize_reqd)
+      {
+        cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_I420);
+        cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                   cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+        cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+        synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
       }
-      else if (output_format == GST_VIDEO_FORMAT_NV12) {
-        cv::Mat tmp2;
-        if (resize_reqd) {
-          cv::resize (synavideoconvertscale->cvImage, tmp2,
-              cv::Size (synavideoconvertscale->out_width,
-                  synavideoconvertscale->out_height), cv::INTER_AREA);
-        }
-        else {
-          synavideoconvertscale->cvImage.copyTo (tmp2);
-        }
-        resize_handled = true;
-        cv::Mat yv12_image;
-        cv::cvtColor (tmp2, yv12_image, cv::COLOR_RGB2YUV_YV12);
-        gst_syna_video_convert_scale_YV12ToNV12 (yv12_image,
-            synavideoconvertscale->cvOutImage);
+      else
+      {
+        synavideoconvertscale->cvUInFrame.copyTo(synavideoconvertscale->cvOutImage);
+      }
+    }
+
+    else
+    {
+      if (resize_reqd)
+      {
+        cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame,
+                   cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+        synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+      }
+      else
+      {
+        synavideoconvertscale->cvUInFrame.copyTo(synavideoconvertscale->cvOutImage);
       }
     }
   }
 
-  if (!resize_handled) {
-    if (resize_reqd) {
-      cv::resize (tmp1, synavideoconvertscale->cvOutImage,
-          cv::Size (synavideoconvertscale->out_width,
-              synavideoconvertscale->out_height), cv::INTER_AREA);
+  if (input_format == GST_VIDEO_FORMAT_NV12 && output_format == GST_VIDEO_FORMAT_BGRA)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale, "NV12 - BGRA\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2BGRA_NV12);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
     }
-    else {
-      tmp1.copyTo (synavideoconvertscale->cvOutImage);
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2BGRA_NV12);
     }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
   }
-  // Unmap the input and output frames after processing
-  if (inframe.buffer) {
-    gst_video_frame_unmap (&inframe);
+  else if (input_format == GST_VIDEO_FORMAT_NV12 && output_format == GST_VIDEO_FORMAT_RGB)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"NV12 - RGB\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_NV12);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_NV12);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
   }
 
-  if (outframe.buffer) {
-    gst_video_frame_unmap (&outframe);
+  else if (input_format == GST_VIDEO_FORMAT_BGRA && output_format == GST_VIDEO_FORMAT_RGB)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"BGRA - RGB\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_BGRA2RGB);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_BGRA2RGB);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+  else if (input_format == GST_VIDEO_FORMAT_RGB && output_format == GST_VIDEO_FORMAT_BGRA)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"RGB - BGRA\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_RGB2BGRA);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2BGRA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+     GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_RGB && output_format == GST_VIDEO_FORMAT_NV12)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"RGB - NV12\n");
+    if (resize_reqd)
+    {
+
+      cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::UMat yv12_image;
+      cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_RGB2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+
+    else
+    {
+      cv::UMat yv12_image;
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, yv12_image, cv::COLOR_RGB2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_BGRA && output_format == GST_VIDEO_FORMAT_NV12)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"BGRA - NV12\n");
+    if (resize_reqd)
+    {
+      cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::UMat yv12_image;
+      cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_BGRA2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+
+    else
+    {
+      cv::UMat yv12_image;
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, yv12_image, cv::COLOR_BGRA2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_I420 && output_format == GST_VIDEO_FORMAT_RGB)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"I420 - RGB\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_I420);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_I420);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_I420 && output_format == GST_VIDEO_FORMAT_BGRA)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"I420 - BGRA\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2BGRA_I420);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2BGRA_I420);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_RGB && output_format == GST_VIDEO_FORMAT_I420)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"RGB - I420\n");
+    if (resize_reqd)
+    {
+
+      cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_BGRA && output_format == GST_VIDEO_FORMAT_I420)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"BGRA - I420\n");
+    if (resize_reqd)
+    {
+
+      cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_BGRA2YUV_I420);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_BGRA2YUV_I420);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_NV12 && output_format == GST_VIDEO_FORMAT_I420)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"NV12 -RGB- I420\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_NV12);
+      cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_NV12);
+      cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_I420 && output_format == GST_VIDEO_FORMAT_NV12)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"I420 -RGB- NV12\n");
+    cv::UMat yv12_image;
+
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_I420);
+      cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_RGB2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_I420);
+      cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_RGB2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+  else if (input_format == GST_VIDEO_FORMAT_YUY2 && output_format == GST_VIDEO_FORMAT_BGRA)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"YUY2 - BGRA\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2BGRA_YUY2);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2BGRA_YUY2);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+  else if (input_format == GST_VIDEO_FORMAT_YUY2 && output_format == GST_VIDEO_FORMAT_RGB)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"YUY2 - RGB\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_YUY2);
+      cv::resize(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_YUY2);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+  else if (input_format == GST_VIDEO_FORMAT_RGB && output_format == GST_VIDEO_FORMAT_YUY2)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"RGB - YUY2\n");
+    if (resize_reqd)
+    {
+      cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::UMat yuv_image;
+      cv::cvtColor(synavideoconvertscale->tmp1, yuv_image, cv::COLOR_RGB2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+    else
+    {
+      cv::UMat yuv_image;
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, yuv_image, cv::COLOR_RGB2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_BGRA && output_format == GST_VIDEO_FORMAT_YUY2)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"BGRA - YUY2\n");
+    if (resize_reqd)
+    {
+      cv::resize(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::UMat yuv_image;
+      cv::UMat bgr_image;
+      cv::cvtColor(synavideoconvertscale->tmp1, bgr_image, cv::COLOR_BGRA2BGR);
+      cv::cvtColor(bgr_image, yuv_image, cv::COLOR_BGR2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+    else
+    {
+      cv::UMat yuv_image;
+      cv::UMat bgr_image;
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, bgr_image, cv::COLOR_BGRA2BGR);
+      cv::cvtColor(bgr_image, yuv_image, cv::COLOR_BGR2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_NV12 && output_format == GST_VIDEO_FORMAT_YUY2)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"NV12 - YUY2\n");
+    cv::UMat yuv_image;
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_NV12);
+      cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, yuv_image, cv::COLOR_RGB2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_NV12);
+      cv::cvtColor(synavideoconvertscale->tmp1, yuv_image, cv::COLOR_RGB2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+  else if (input_format == GST_VIDEO_FORMAT_I420 && output_format == GST_VIDEO_FORMAT_YUY2)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"I420 - YUY2\n");
+    cv::UMat yuv_image;
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_I420);
+      cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, yuv_image, cv::COLOR_RGB2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_I420);
+      cv::cvtColor(synavideoconvertscale->tmp1, yuv_image, cv::COLOR_RGB2YUV);
+      gst_syna_video_convert_scale_YV444TOYUY2(yuv_image, synavideoconvertscale->cvUOutFrame);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+  else if (input_format == GST_VIDEO_FORMAT_YUY2 && output_format == GST_VIDEO_FORMAT_I420)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"YUY2 - I420\n");
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_YUY2);
+      cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_YUY2);
+      cv::cvtColor(synavideoconvertscale->tmp1, synavideoconvertscale->cvUOutFrame, cv::COLOR_RGB2YUV_I420);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  else if (input_format == GST_VIDEO_FORMAT_YUY2 && output_format == GST_VIDEO_FORMAT_NV12)
+  {
+    GST_DEBUG_OBJECT (synavideoconvertscale,"YUY2 - NV12");
+    cv::UMat yv12_image;
+    if (resize_reqd)
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->cvUOutFrame, cv::COLOR_YUV2RGB_YUY2);
+      cv::resize(synavideoconvertscale->cvUOutFrame, synavideoconvertscale->tmp1,
+                 cv::Size(synavideoconvertscale->out_width, synavideoconvertscale->out_height), cv::INTER_AREA);
+      cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_RGB2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+    else
+    {
+      cv::cvtColor(synavideoconvertscale->cvUInFrame, synavideoconvertscale->tmp1, cv::COLOR_YUV2RGB_YUY2);
+      cv::cvtColor(synavideoconvertscale->tmp1, yv12_image, cv::COLOR_RGB2YUV_YV12);
+      gst_syna_video_convert_scale_YV12ToNV12(yv12_image, synavideoconvertscale->cvUOutFrame);
+    }
+    synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
+    GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
+  }
+
+  if (inframe.buffer)
+  {
+    gst_video_frame_unmap(&inframe);
+  }
+
+  if (outframe.buffer)
+  {
+    gst_video_frame_unmap(&outframe);
   }
   return GST_FLOW_OK;
 }
@@ -632,31 +1025,67 @@ plugin_init (GstPlugin * plugin)
 }
 
 static void
-gst_syna_video_convert_scale_YV12ToNV12 (const cv::Mat & input,
-    cv::Mat & output)
+gst_syna_video_convert_scale_YV12ToNV12 (const cv::UMat & input,
+    cv::UMat & output)
 {
+  // Get the input as Mat
+  cv::Mat inputMat = input.getMat(cv::ACCESS_READ);
   int width = input.cols;
   int height = input.rows * 2 / 3;
-  int stride = (int) input.step[0];
+  int stride = (int)inputMat.step[0];
 
-  input.copyTo (output);
-  cv::Mat inV =
-      cv::Mat (cv::Size (width / 2, height / 2), CV_8UC1,
-      (unsigned char *) input.data + stride * height, stride / 2);
-  cv::Mat inU =
-      cv::Mat (cv::Size (width / 2, height / 2), CV_8UC1,
-      (unsigned char *) input.data + stride * height +
-      (stride / 2) * (height / 2), stride / 2);
+  // Copy input to output as UMat
+  input.copyTo(output);
+  cv::Mat outputMat = output.getMat(cv::ACCESS_WRITE); // Access output as Mat for element access
 
-  for (int row = 0; row < height / 2; row++) {
-    for (int col = 0; col < width / 2; col++) {
-      output.at < uchar > (height + row, 2 * col) = inU.at < uchar > (row, col);
-      output.at < uchar > (height + row, 2 * col + 1) =
-          inV.at < uchar > (row, col);
+  // Create U and V channel matrices
+  cv::Mat inV = cv::Mat(cv::Size(width / 2, height / 2), CV_8UC1,
+                        (unsigned char *)inputMat.data + stride * height, stride / 2);
+  cv::Mat inU = cv::Mat(cv::Size(width / 2, height / 2), CV_8UC1,
+                        (unsigned char *)inputMat.data + stride * height + (stride / 2) * (height / 2), stride / 2);
+
+  // Combine U and V planes into NV12 format
+  for (int row = 0; row < height / 2; row++)
+  {
+    for (int col = 0; col < width / 2; col++)
+    {
+      outputMat.at<uchar>(height + row, 2 * col) = inU.at<uchar>(row, col);     // U plane
+      outputMat.at<uchar>(height + row, 2 * col + 1) = inV.at<uchar>(row, col); // V plane
     }
   }
 }
 
+static void gst_syna_video_convert_scale_YV444TOYUY2(const cv::UMat &yuv444, cv::UMat &yuy2)
+{
+  int width = yuv444.cols;
+  int height = yuv444.rows;
+
+  // Create an empty 2-channel YUY2 image (since YUY2 is interleaved)
+  yuy2.create(height, width, CV_8UC2);
+
+  // Access the YUV444 data
+  cv::Mat yuv444Mat = yuv444.getMat(cv::ACCESS_READ);
+  cv::Mat yuy2Mat = yuy2.getMat(cv::ACCESS_WRITE);
+
+  // Iterate over each pixel pair to pack YUV444 into YUY2 format
+  for (int y = 0; y < height; y++)
+  {
+    for (int x = 0; x < width; x += 2)
+    {
+      // Get YUV values from YUV444 (3 channels)
+      uchar Y1 = yuv444Mat.at<cv::Vec3b>(y, x)[0];
+      uchar U = yuv444Mat.at<cv::Vec3b>(y, x)[1];
+      uchar V = yuv444Mat.at<cv::Vec3b>(y, x)[2];
+      uchar Y2 = yuv444Mat.at<cv::Vec3b>(y, x + 1)[0];
+
+      // Pack into YUY2 format
+      yuy2Mat.at<cv::Vec2b>(y, x)[0] = Y1;     // Y1
+      yuy2Mat.at<cv::Vec2b>(y, x)[1] = U;      // U (shared between Y1 and Y2)
+      yuy2Mat.at<cv::Vec2b>(y, x + 1)[0] = Y2; // Y2
+      yuy2Mat.at<cv::Vec2b>(y, x + 1)[1] = V;  // V (shared between Y1 and Y2)
+    }
+  }
+}
 
 static gboolean gst_syna_video_convert_scale_cvmat_params_from_video_info
     (GstVideoInfo * info, gint * width, gint * height, int *cv_type,

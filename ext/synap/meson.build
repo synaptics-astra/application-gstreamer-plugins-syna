@@ -8,6 +8,7 @@ synap_sources = [
   'gstsynapinfer.cpp',
   'gstsynapoverlay.cpp',
   'gstsynapoverlayrender.cpp',
+  'gstsynapimageproc.cpp',
   'synapmeta.cpp',
 ]
 
