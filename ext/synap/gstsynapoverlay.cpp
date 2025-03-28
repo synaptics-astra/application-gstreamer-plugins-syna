@@ -49,9 +49,10 @@
 GST_DEBUG_CATEGORY_STATIC (gst_synap_overlay_debug_category);
 #define GST_CAT_DEFAULT gst_synap_overlay_debug_category
 
+#define IC_RENDER_CTRL_LOW_THRESHOLD_DEFAULT        (8.5)
+#define IC_RENDER_CTRL_PERSISTENCE_FRAMES_DEFAULT   (3)
+
 /* prototypes */
-
-
 static void gst_synap_overlay_set_property (GObject * object,
     guint property_id, const GValue * value, GParamSpec * pspec);
 static void gst_synap_overlay_get_property (GObject * object,
@@ -79,6 +80,8 @@ enum
 {
   PROP_0,
   PROP_LABEL,
+  PROP_RENDERCTRL_LOW_THRESHOLD,
+  PROP_RENDERCTRL_PERSISTENCE_FRAMES
 };
 
 /* pad templates */
@@ -152,6 +155,16 @@ gst_synap_overlay_class_init (GstSynapOverlayClass * klass)
       g_param_spec_string ("label", "Label filepath",
           "File path to the label file",
           NULL, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_RENDERCTRL_LOW_THRESHOLD,
+      g_param_spec_float ("lowthreshold","Lowthreshold",
+          "Render control Low threshold for hiding", 0, G_MAXFLOAT, 0,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_RENDERCTRL_PERSISTENCE_FRAMES,
+      g_param_spec_int ("persistenceframes", "PersistenceFrames", "Render control number of frames to persist", 0,
+          G_MAXINT, 0,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
@@ -171,7 +184,12 @@ gst_synap_overlay_init (GstSynapOverlay * synapoverlay)
   /* Initialize parameters */
   synapoverlay->metaQueue.overlaydata = NULL;
   synapoverlay->label = NULL;
+  synapoverlay->renderctrlLowThreshold = IC_RENDER_CTRL_LOW_THRESHOLD_DEFAULT;
+  synapoverlay->renderctrlPersistenceFrames = IC_RENDER_CTRL_PERSISTENCE_FRAMES_DEFAULT;
   synapoverlay->queue = queue<MetaQueue>();
+  strncpy(synapoverlay->icState.label, "", sizeof( synapoverlay->icState.label));
+  synapoverlay->icState.confidence = 0.0;
+  synapoverlay->icState.persistence_count = 0;
 }
 
 void
@@ -191,6 +209,21 @@ gst_synap_overlay_set_property (GObject * object, guint property_id,
       }
     }
     break;
+
+    case PROP_RENDERCTRL_LOW_THRESHOLD:
+    {
+      synapoverlay->renderctrlLowThreshold = g_value_get_float (value);
+      GST_INFO ("Render Control Low Threshold: %f", synapoverlay->renderctrlLowThreshold);
+    }
+    break;
+
+    case PROP_RENDERCTRL_PERSISTENCE_FRAMES:
+    {
+      synapoverlay->renderctrlPersistenceFrames = g_value_get_int (value);
+      GST_INFO ("Render Control Low Threshold: %d", synapoverlay->renderctrlPersistenceFrames);
+    }
+    break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -209,6 +242,18 @@ gst_synap_overlay_get_property (GObject * object, guint property_id,
     case PROP_LABEL:
     {
       g_value_set_string (value, synapoverlay->label);
+    }
+    break;
+
+    case PROP_RENDERCTRL_LOW_THRESHOLD:
+    {
+      g_value_set_float (value, synapoverlay->renderctrlLowThreshold);
+    }
+    break;
+
+    case PROP_RENDERCTRL_PERSISTENCE_FRAMES:
+    {
+      g_value_set_int (value, synapoverlay->renderctrlPersistenceFrames);
     }
     break;
 

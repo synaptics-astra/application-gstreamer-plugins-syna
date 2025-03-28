@@ -52,6 +52,13 @@ struct MetaQueue {
   GstClockTime pts;
 };
 
+// Structure to store last stable classification
+typedef struct {
+  char label[256];         // Last displayed class label
+  float confidence;       // Last stable confidence
+  int persistence_count;  // Countdown frames before removing text
+} ClassificationState;
+
 struct _GstSynapOverlay
 {
   GstBaseTransform base_synapoverlay;
@@ -62,9 +69,14 @@ struct _GstSynapOverlay
   /* Parameters */
   gchar* label;
 
+  /* Settings for render control for image classification */
+  gfloat renderctrlLowThreshold;
+  gint renderctrlPersistenceFrames;
+
   GstVideoInfo videoinfo;
   MetaQueue metaQueue;
   queue<MetaQueue> queue;
+  ClassificationState icState;
 
   /* SyNAP */
   LabelInfo *labelinfo;

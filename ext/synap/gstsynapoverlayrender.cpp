@@ -40,6 +40,37 @@ gst_synap_overlay_render_classification (GstSynapOverlay * synapoverlay,
   cairo_t *cr;
   GstVideoFrame frame;
 
+  g_mutex_lock (&synapoverlay->data_lock);
+  Classifier::Result * result = (Classifier::Result *) synapoverlay->metaQueue.overlaydata;
+  g_return_val_if_fail (result != NULL, FALSE);
+
+  // Post-process logic for stable text display
+  char new_label[256];
+  float new_confidence = result->items[0].confidence;
+  strcpy (new_label, synapoverlay->labelinfo->label (result->items[0].class_index).c_str ());
+  if (new_confidence >= synapoverlay->metaQueue.confthreshold) {
+    // Strong confidence: Update the label and reset persistence timer
+    strncpy(synapoverlay->icState.label, new_label, sizeof(synapoverlay->icState.label) - 1);
+    synapoverlay->icState.label[sizeof(synapoverlay->icState.label) - 1] = '\0';  // Ensure null termination
+    synapoverlay->icState.confidence = new_confidence;
+    synapoverlay->icState.persistence_count = synapoverlay->renderctrlPersistenceFrames;
+  }
+  else if (new_confidence < synapoverlay->renderctrlLowThreshold) {
+    // Confidence too low: Reduce persistence count
+    if (synapoverlay->icState.persistence_count > 0) {
+      synapoverlay->icState.persistence_count--;
+    } else {
+      // Hide text when timeout expires
+      synapoverlay->icState.label[0] = '\0'; // Empty string (no display)
+      synapoverlay->icState.confidence = 0.0;
+    }
+  } else {
+    // Between thresholds: Keep last stable state
+    if (synapoverlay->icState.persistence_count > 0) {
+      synapoverlay->icState.persistence_count--;
+    }
+  }
+
   GST_DEBUG ("SynapOverlay: render classification");
   if (!gst_video_frame_map (&frame, &synapoverlay->videoinfo, buffer,
           GST_MAP_READWRITE)) {
@@ -62,25 +93,17 @@ gst_synap_overlay_render_classification (GstSynapOverlay * synapoverlay,
     return FALSE;
   }
 
-  g_mutex_lock (&synapoverlay->data_lock);
-  Classifier::Result * result = (Classifier::Result *) synapoverlay->metaQueue.overlaydata;
-  g_return_val_if_fail (result != NULL, FALSE);
+  cairo_select_font_face (cr, "Sans", CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
+  cairo_set_font_size (cr, 35.0);
+  cairo_move_to (cr, 10, 35);
+  cairo_text_path (cr,synapoverlay->icState.label);
+  cairo_set_source_rgb (cr, 1, 1, 1);
+  cairo_fill_preserve (cr);
+  cairo_set_source_rgb (cr, 1, 1, 1);
+  cairo_set_line_width (cr, .3);
+  cairo_stroke (cr);
+  cairo_fill_preserve (cr);
 
-  if (result->items[0].confidence > synapoverlay->metaQueue.confthreshold) {
-    if (synapoverlay->label != NULL) {
-      cairo_select_font_face (cr, "Sans", CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
-      cairo_set_font_size (cr, 35.0);
-      cairo_move_to (cr, 10, 35);
-      cairo_text_path (cr,
-          synapoverlay->labelinfo->label (result->items[0].class_index).c_str ());
-      cairo_set_source_rgb (cr, 1, 1, 1);
-      cairo_fill_preserve (cr);
-      cairo_set_source_rgb (cr, 1, 1, 1);
-      cairo_set_line_width (cr, .3);
-      cairo_stroke (cr);
-      cairo_fill_preserve (cr);
-    }
-  }
   g_mutex_unlock (&synapoverlay->data_lock);
   cairo_destroy (cr);
   cairo_surface_destroy (surface);
