@@ -41,14 +41,14 @@ gst_synap_overlay_render_classification (GstSynapOverlay * synapoverlay,
   GstVideoFrame frame;
 
   g_mutex_lock (&synapoverlay->data_lock);
-  Classifier::Result * result = (Classifier::Result *) synapoverlay->metaQueue.overlaydata;
+  Classifier::Result * result = (Classifier::Result *) synapoverlay->overlay_data.synapmeta.type.classifier.data;
   g_return_val_if_fail (result != NULL, FALSE);
 
   // Post-process logic for stable text display
   char new_label[256];
   float new_confidence = result->items[0].confidence;
   strcpy (new_label, synapoverlay->labelinfo->label (result->items[0].class_index).c_str ());
-  if (new_confidence >= synapoverlay->metaQueue.confthreshold) {
+  if (new_confidence >= synapoverlay->overlay_data.synapmeta.type.classifier.confthreshold) {
     // Strong confidence: Update the label and reset persistence timer
     strncpy(synapoverlay->icState.label, new_label, sizeof(synapoverlay->icState.label) - 1);
     synapoverlay->icState.label[sizeof(synapoverlay->icState.label) - 1] = '\0';  // Ensure null termination
@@ -123,11 +123,11 @@ gst_synap_overlay_render_poseline (GstSynapOverlay *synapoverlay, GstVideoFrame 
 
   if ((landmarks[start].visibility > GST_SYNAP_POSE_VISIBILITY_THRESHOLD) &&
        (landmarks[end].visibility > GST_SYNAP_POSE_VISIBILITY_THRESHOLD)) {
-    xs = landmarks[start].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->metaQueue.width;
-    ys = landmarks[start].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->metaQueue.height;
+    xs = landmarks[start].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->overlay_data.synapmeta.type.detector.width;
+    ys = landmarks[start].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->overlay_data.synapmeta.type.detector.height;
 
-    xe = landmarks[end].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->metaQueue.width;
-    ye = landmarks[end].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->metaQueue.height;
+    xe = landmarks[end].x * GST_VIDEO_FRAME_WIDTH (frame) / synapoverlay->overlay_data.synapmeta.type.detector.width;
+    ye = landmarks[end].y * GST_VIDEO_FRAME_HEIGHT (frame) / synapoverlay->overlay_data.synapmeta.type.detector.height;
 
     cairo_move_to (cr, xs, ys);
     cairo_line_to (cr, xe, ye);
@@ -167,7 +167,7 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
   }
 
   g_mutex_lock (&synapoverlay->data_lock);
-  Detector::Result * result = (Detector::Result *) synapoverlay->metaQueue.overlaydata;
+  Detector::Result * result = (Detector::Result *) synapoverlay->overlay_data.synapmeta.type.detector.data;
   g_return_val_if_fail (result != NULL, FALSE);
 
   gdouble x, y, width, height;
@@ -225,8 +225,8 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
       /* dot */
       for (size_t j = 0; j < GST_SYNAP_POSE_SIZE; ++j) {
         if (result->items[i].landmarks[j].visibility > GST_SYNAP_POSE_VISIBILITY_THRESHOLD) {
-          x = result->items[i].landmarks[j].x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->metaQueue.width;
-          y = result->items[i].landmarks[j].y * GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->metaQueue.height;
+          x = result->items[i].landmarks[j].x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->overlay_data.synapmeta.type.detector.width;
+          y = result->items[i].landmarks[j].y * GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->overlay_data.synapmeta.type.detector.height;
           cairo_arc (cr, x, y, 3, 0, 2 * M_PI);
           cairo_fill (cr);
         }
@@ -234,13 +234,13 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
     }
     else {
     x = result->items[i].bounding_box.origin.x *
-        GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->metaQueue.width;
+        GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->overlay_data.synapmeta.type.detector.width;
     y = result->items[i].bounding_box.origin.y *
-        GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->metaQueue.height;
+        GST_VIDEO_FRAME_HEIGHT (&frame) / synapoverlay->overlay_data.synapmeta.type.detector.height;
     width =
-        result->items[i].bounding_box.size.x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->metaQueue.width;
+        result->items[i].bounding_box.size.x * GST_VIDEO_FRAME_WIDTH (&frame) / synapoverlay->overlay_data.synapmeta.type.detector.width;
     height =
-        result->items[i].bounding_box.size.y * GST_VIDEO_FRAME_HEIGHT (&frame) /synapoverlay->metaQueue.height;
+        result->items[i].bounding_box.size.y * GST_VIDEO_FRAME_HEIGHT (&frame) /synapoverlay->overlay_data.synapmeta.type.detector.height;
 
     /* draw rectangle */
     cairo_rectangle (cr, x, y, width, height);
@@ -303,9 +303,9 @@ gst_synap_overlay_render (GstBaseTransform * trans, GstBuffer * buffer)
     }
   }
 
-  if (synapoverlay->metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER) {
+  if (synapoverlay->overlay_data.synapmeta.mode == GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER) {
     ret = gst_synap_overlay_render_classification (synapoverlay, buffer, format);
-  } else if (synapoverlay->metaQueue.mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
+  } else if (synapoverlay->overlay_data.synapmeta.mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
     ret = gst_synap_overlay_render_detection (synapoverlay, buffer, format);
   }
 

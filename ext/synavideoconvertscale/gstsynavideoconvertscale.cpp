@@ -369,57 +369,6 @@ gst_syna_video_convert_scale_set_caps (GstBaseTransform * trans,
     g_error_free (err);
     return FALSE;
   }
-  // Retrieve input and output formats from the video info structures
-  GstVideoFormat input_format =
-      GST_VIDEO_INFO_FORMAT (&synavideoconvertscale->videoinfo);
-  GstVideoFormat output_format =
-      GST_VIDEO_INFO_FORMAT (&synavideoconvertscale->videooutinfo);
-
-  // Input format handling
-  if (input_format == GST_VIDEO_FORMAT_RGB) {
-    // RGB: Width x Height with 3 channels
-    synavideoconvertscale->cvImage.create (cv::Size (synavideoconvertscale->
-            in_width, synavideoconvertscale->in_height), CV_8UC3);
-  } else if (input_format == GST_VIDEO_FORMAT_BGRA) {
-    // BGRA: Width x Height with 4 channels
-    synavideoconvertscale->cvImage.create (cv::Size (synavideoconvertscale->
-            in_width, synavideoconvertscale->in_height), CV_8UC4);
-  } else if (input_format == GST_VIDEO_FORMAT_NV12 || input_format == GST_VIDEO_FORMAT_I420) {
-    // NV12 and I420: Single channel with height * 3/2
-    synavideoconvertscale->cvImage.create (cv::Size (synavideoconvertscale->
-            in_width, synavideoconvertscale->in_height * 3 / 2), CV_8UC1);
-  } else if (input_format == GST_VIDEO_FORMAT_YUY2) {
-    // YUY2 is interleaved, width x height with 2 channels
-    synavideoconvertscale->cvImage.create(cv::Size(synavideoconvertscale->in_width, synavideoconvertscale->in_height), CV_8UC2);
-  } else {
-    // Unsupported format
-    GST_WARNING_OBJECT (trans, "Unsupported input format for synavideoconvertscale plugin: %d",
-        input_format);
-    return FALSE;
-  }
-
-  // Output format handling
-  if (output_format == GST_VIDEO_FORMAT_RGB) {
-    // RGB: Width x Height with 3 channels
-    synavideoconvertscale->cvOutImage.create (cv::Size (synavideoconvertscale->
-            out_width, synavideoconvertscale->out_height), CV_8UC3);
-  } else if (output_format == GST_VIDEO_FORMAT_BGRA) {
-    // BGRA: Width x Height with 4 channels
-    synavideoconvertscale->cvOutImage.create (cv::Size (synavideoconvertscale->
-            out_width, synavideoconvertscale->out_height), CV_8UC4);
-  } else if (output_format == GST_VIDEO_FORMAT_NV12 || output_format == GST_VIDEO_FORMAT_I420) {
-    // NV12: Similar to I420, with width x height * 3/2
-    synavideoconvertscale->cvOutImage.create (cv::Size (synavideoconvertscale->
-            out_width, synavideoconvertscale->out_height * 3 / 2), CV_8UC1);
-  } else if (output_format == GST_VIDEO_FORMAT_YUY2) {
-    // YUY2 is interleaved, width x height with 2 channels
-    synavideoconvertscale->cvOutImage.create(cv::Size(synavideoconvertscale->in_width, synavideoconvertscale->in_height), CV_8UC2);
-  } else {
-    // Unsupported output format
-    GST_WARNING_OBJECT (trans, "Unsupported output format for synavideoconvertscale plugin: %d",
-        output_format);
-    return FALSE;
-  }
 
   return TRUE;
 }
@@ -517,18 +466,60 @@ gst_syna_video_convert_scale_transform (GstBaseTransform * trans,
     GST_ERROR ("Frame map error for output frame");
     return GST_FLOW_ERROR;
   }
-  // Set the OpenCV Mat data pointers to the GStreamer buffer data
-  synavideoconvertscale->cvImage.data = (unsigned char *) inframe.data[0];
-  synavideoconvertscale->cvImage.datastart = (unsigned char *) inframe.data[0];
-  synavideoconvertscale->cvOutImage.data = (unsigned char *) outframe.data[0];
-  synavideoconvertscale->cvOutImage.datastart =
-      (unsigned char *) outframe.data[0];
 
   // Get the output format negotiated
   GstVideoFormat output_format =
       GST_VIDEO_INFO_FORMAT (&synavideoconvertscale->videooutinfo);
   GstVideoFormat input_format =
       GST_VIDEO_INFO_FORMAT (&synavideoconvertscale->videoinfo);
+
+  // Input format handling
+  if (input_format == GST_VIDEO_FORMAT_RGB) {
+    // RGB: Width x Height with 3 channels
+    synavideoconvertscale->cvImage = cv::Mat (cv::Size (synavideoconvertscale->
+            in_width, synavideoconvertscale->in_height), CV_8UC3, (unsigned char *) inframe.data[0]);
+  } else if (input_format == GST_VIDEO_FORMAT_BGRA) {
+    // BGRA: Width x Height with 4 channels
+    synavideoconvertscale->cvImage = cv::Mat (cv::Size (synavideoconvertscale->
+            in_width, synavideoconvertscale->in_height), CV_8UC4, inframe.data[0]);
+  } else if (input_format == GST_VIDEO_FORMAT_NV12 || input_format == GST_VIDEO_FORMAT_I420) {
+    // NV12 and I420: Single channel with height * 3/2
+    synavideoconvertscale->cvImage = cv::Mat (cv::Size (synavideoconvertscale->
+            in_width, synavideoconvertscale->in_height * 3 / 2), CV_8UC1, inframe.data[0]);
+  } else if (input_format == GST_VIDEO_FORMAT_YUY2) {
+    // YUY2 is interleaved, width x height with 2 channels
+    synavideoconvertscale->cvImage = cv::Mat (cv::Size(synavideoconvertscale->in_width,
+        synavideoconvertscale->in_height), CV_8UC2, inframe.data[0]);
+  } else {
+    // Unsupported format
+    GST_ERROR ("Unsupported input format for synavideoconvertscale plugin: %d",
+        input_format);
+    return GST_FLOW_ERROR;
+  }
+
+  // Output format handling
+  if (output_format == GST_VIDEO_FORMAT_RGB) {
+    // RGB: Width x Height with 3 channels
+    synavideoconvertscale->cvOutImage = cv::Mat (cv::Size (synavideoconvertscale->
+            out_width, synavideoconvertscale->out_height), CV_8UC3, (unsigned char *) outframe.data[0]);
+  } else if (output_format == GST_VIDEO_FORMAT_BGRA) {
+    // BGRA: Width x Height with 4 channels
+    synavideoconvertscale->cvOutImage = cv::Mat (cv::Size (synavideoconvertscale->
+            out_width, synavideoconvertscale->out_height), CV_8UC4, (unsigned char *) outframe.data[0]);
+  } else if (output_format == GST_VIDEO_FORMAT_NV12 || output_format == GST_VIDEO_FORMAT_I420) {
+    // NV12: Similar to I420, with width x height * 3/2
+    synavideoconvertscale->cvOutImage = cv::Mat (cv::Size (synavideoconvertscale->
+            out_width, synavideoconvertscale->out_height * 3 / 2), CV_8UC1, (unsigned char *) outframe.data[0]);
+  } else if (output_format == GST_VIDEO_FORMAT_YUY2) {
+    // YUY2 is interleaved, width x height with 2 channels
+    synavideoconvertscale->cvOutImage = cv::Mat(cv::Size(synavideoconvertscale->in_width,
+            synavideoconvertscale->in_height), CV_8UC2, (unsigned char *) outframe.data[0]);
+  } else {
+    // Unsupported output format
+    GST_ERROR ("Unsupported output format for synavideoconvertscale plugin: %d",
+        output_format);
+    return GST_FLOW_ERROR;
+  }
 
   gboolean resize_reqd =
       (synavideoconvertscale->in_width != synavideoconvertscale->out_width)
@@ -1004,6 +995,10 @@ gst_syna_video_convert_scale_transform (GstBaseTransform * trans,
     synavideoconvertscale->cvUOutFrame.copyTo(synavideoconvertscale->cvOutImage);
     GST_DEBUG_OBJECT (synavideoconvertscale,"End transform\n");
   }
+
+  synavideoconvertscale->tmp1.release();
+  synavideoconvertscale->cvUOutFrame.release();
+  synavideoconvertscale->cvUInFrame.release();
 
   if (inframe.buffer)
   {

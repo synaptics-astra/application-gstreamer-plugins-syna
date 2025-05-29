@@ -77,6 +77,19 @@ static gboolean gst_synap_infer_postproc_classifier (GstBaseTransform * trans,
     GstBuffer * buf);
 static gboolean gst_synap_infer_postproc_detector (GstBaseTransform * trans,
     GstBuffer * buf);
+static gboolean gst_synap_infer_preproc_recognition (GstBaseTransform * trans,
+    GstBuffer * buf, InputData &image);
+static gboolean gst_synap_infer_postproc_recognition (GstBaseTransform * trans,
+    GstBuffer * buf);
+
+static gboolean gst_synap_infer_head_pose (const Rect& face_rect,
+    const std::vector<Dim2d>& landmarks);
+static cv::Mat gst_synap_infer_get_affine_transform (const vector<Dim2d>& src_points);
+static InputData gst_synap_infer_align_face (const InputData& input_image,
+    const Rect& face_rect, const std::vector<Dim2d>& landmarks);
+static InputData gst_synap_infer_recognize_face (GstSynapInfer *infer,
+    const InputData& input_image, const Rect& face_rect,
+    const std::vector<Dim2d>& landmarks);
 
 enum
 {
@@ -90,10 +103,11 @@ enum
   PROP_INFER_STATISTICS,
 };
 
-#define GST_SYNAP_DEFAULT_INFERENCE_CLASSIFIER  (2)
-#define GST_SYNAP_DEFAULT_THRESHOLD_CLASSIFIER  (11.0)
-#define GST_SYNAP_DEFAULT_INFERENCE_DETECTOR    (5)
-#define GST_SYNAP_DEFAULT_THRESHOLD_DETECTOR    (0.5)
+#define GST_SYNAP_DEFAULT_INFERENCE_CLASSIFIER             (2)
+#define GST_SYNAP_DEFAULT_THRESHOLD_CLASSIFIER             (11.0)
+#define GST_SYNAP_DEFAULT_INFERENCE_DETECTOR               (5)
+#define GST_SYNAP_DEFAULT_THRESHOLD_DETECTOR               (0.5)
+#define GST_SYNAP_DEFAULT_SIDE_FACE_THRESHOLD_RECOGNITION  (0.6)
 
 /* pad templates */
 
@@ -404,6 +418,9 @@ gst_synap_infer_start (GstBaseTransform * trans)
     } else if (g_strcmp0 (synapinfer->mode, "detector") == 0) {
       GST_INFO ("Post-Processing Mode: Detector");
       synapinfer->postproc_mode = GST_SYNAP_POSTPROCESSING_MODE_DETECTOR;
+    } else if (g_strcmp0 (synapinfer->mode, "recognition") == 0) {
+      GST_INFO ("Post-Processing Mode: Face Recognition");
+      synapinfer->postproc_mode = GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION;
     }
   }
   if (synapinfer->output != NULL) {
@@ -435,7 +452,8 @@ gst_synap_infer_start (GstBaseTransform * trans)
     synapinfer->confthreshold = (synapinfer->confthreshold == -1) ? GST_SYNAP_DEFAULT_THRESHOLD_CLASSIFIER : synapinfer->confthreshold;
     synapinfer->classifier = new Classifier (synapinfer->numinference);
     g_return_val_if_fail (synapinfer->classifier != NULL, FALSE);
-  } else if (synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
+  } else if (synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR ||
+      synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION) {
     /* Detector */
     synapinfer->numinference = (synapinfer->numinference == -1) ? GST_SYNAP_DEFAULT_INFERENCE_DETECTOR : synapinfer->numinference;
     synapinfer->confthreshold = (synapinfer->confthreshold == -1) ? GST_SYNAP_DEFAULT_THRESHOLD_DETECTOR : synapinfer->confthreshold;
@@ -507,10 +525,23 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     return GST_FLOW_ERROR;
   }
   Rect assigned_rect;
-  if (!synapinfer->preprocessor->assign (synapinfer->network->inputs, image, 0,
+  if (synapinfer->postproc_mode != GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION) {
+    if (!synapinfer->preprocessor->assign (synapinfer->network->inputs, image, 0,
           &assigned_rect)) {
-    GST_ERROR ("Error assigning input to tensor");
-    return GST_FLOW_ERROR;
+      GST_ERROR ("Error assigning input to tensor");
+      return GST_FLOW_ERROR;
+    }
+  } else {
+    if (!gst_synap_infer_preproc_recognition (trans, buf, image)) {
+      GST_INFO ("No proper face found from pre-processing");
+      gst_buffer_unmap (buf, &map);
+      return GST_FLOW_OK;
+    }
+    if (!synapinfer->preprocessor->assign (synapinfer->network->inputs, synapinfer->face_image, 0,
+          &assigned_rect)) {
+      GST_ERROR ("Error assigning input to tensor");
+      return GST_FLOW_ERROR;
+    }
   }
 
   /* Track time for inference */
@@ -539,6 +570,8 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     postproc_result = gst_synap_infer_postproc_classifier (trans, buf);
   } else if (synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
     postproc_result = gst_synap_infer_postproc_detector (trans, buf);
+  } else if (synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION) {
+    postproc_result = gst_synap_infer_postproc_recognition (trans, buf);
   }
   return (postproc_result ? GST_FLOW_OK : GST_FLOW_ERROR);
 }
@@ -562,7 +595,7 @@ gst_synap_infer_postproc_classifier (GstBaseTransform * trans, GstBuffer * buf)
   }
 
   if (synapinfer->outputmode == GST_SYNAP_OUTPUT_MODE_OVERLAY) {
-    gst_buffer_add_synap_meta (buf, result, synapinfer->postproc_mode,
+    gst_buffer_add_classifier_synap_meta (buf, GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER, result,
         GST_VIDEO_INFO_WIDTH (&synapinfer->videoinfo),
         GST_VIDEO_INFO_HEIGHT (&synapinfer->videoinfo),
         synapinfer->confthreshold);
@@ -604,10 +637,9 @@ gst_synap_infer_postproc_detector (GstBaseTransform * trans, GstBuffer * buf)
     return FALSE;
   }
   if (synapinfer->outputmode == GST_SYNAP_OUTPUT_MODE_OVERLAY) {
-    gst_buffer_add_synap_meta (buf, result, synapinfer->postproc_mode,
-      GST_VIDEO_INFO_WIDTH (&synapinfer->videoinfo),
-      GST_VIDEO_INFO_HEIGHT (&synapinfer->videoinfo),
-      synapinfer->confthreshold);
+    gst_buffer_add_detector_synap_meta (buf, GST_SYNAP_POSTPROCESSING_MODE_DETECTOR, result,
+        GST_VIDEO_INFO_WIDTH (&synapinfer->videoinfo),
+        GST_VIDEO_INFO_HEIGHT (&synapinfer->videoinfo));
   }
   else if (synapinfer->outputmode == GST_SYNAP_OUTPUT_MODE_JSON) {
     std::string resstr = to_json_str (*result);
@@ -624,4 +656,252 @@ gst_synap_infer_postproc_detector (GstBaseTransform * trans, GstBuffer * buf)
     delete result;
   }
   return TRUE;
+}
+
+static gboolean
+gst_synap_infer_preproc_recognition (GstBaseTransform * trans, GstBuffer * buf, InputData &image)
+{
+  GstSynapInfer *synapinfer = GST_SYNAP_INFER (trans);
+
+  GST_DEBUG_OBJECT (synapinfer, "preproc_recog");
+  g_return_val_if_fail (synapinfer != NULL, FALSE);
+  g_return_val_if_fail (GST_IS_SYNAP_INFER (synapinfer), FALSE);
+
+  GstSynapMeta *meta = gst_buffer_get_synap_meta (buf);
+  if (meta == NULL) {
+    GST_ERROR ("Pre-Processing failed, meta is null");
+    return FALSE;
+  }
+
+  Detector::Result * result = (Detector::Result *) meta->type.detector.data;
+  if (result->items.empty()) {
+    delete result;
+    return FALSE;
+  }
+
+  std::vector<std::pair<uint32_t, double>> bounding_box_areas;
+  int bounding_box_index = 0;
+  for (const auto& item : result->items) {
+    const auto& bounding_box = item.bounding_box;
+    double bounding_box_area = bounding_box.size.x * bounding_box.size.y;
+    std::pair<uint32_t, double> area_pair(bounding_box_index, bounding_box_area);
+    bounding_box_areas.push_back(area_pair);
+    bounding_box_index++;
+  }
+
+  sort(bounding_box_areas.begin(), bounding_box_areas.end(),
+      [=](std::pair<uint32_t, double>& a, std::pair<uint32_t, double>& b) {
+      return a.second > b.second;
+      });
+
+  synapinfer->recognition_items.clear();
+  synapinfer->recognition_items.push_back(result->items[bounding_box_areas[0].first]);
+  auto detected_item = synapinfer->recognition_items[0];
+  std::vector<Dim2d> landmarks_2d;
+  landmarks_2d.reserve(detected_item.landmarks.size());
+  std::transform(detected_item.landmarks.begin(), detected_item.landmarks.end(),
+      std::back_inserter(landmarks_2d), [](const Landmark& landmark) {
+      return Dim2d{landmark.x, landmark.y};
+      });
+
+  synapinfer->face_image =
+    gst_synap_infer_recognize_face(synapinfer, image,
+        detected_item.bounding_box, landmarks_2d);
+
+  delete result;
+  if (synapinfer->face_image.empty()) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_synap_infer_postproc_recognition (GstBaseTransform * trans, GstBuffer * buf)
+{
+  GstSynapInfer *synapinfer = GST_SYNAP_INFER (trans);
+
+  GST_DEBUG_OBJECT (synapinfer, "postproc_recog");
+  g_return_val_if_fail (synapinfer != NULL, FALSE);
+  g_return_val_if_fail (GST_IS_SYNAP_INFER (synapinfer), FALSE);
+
+  Tensor& out = synapinfer->network->outputs[0];
+
+  if (!gst_buffer_remove_synap_meta (buf)) {
+    GST_ERROR ("Failed to remove the metadata from the buffer: %p", buf);
+    return FALSE;
+  }
+
+  gst_buffer_add_recognition_synap_meta (buf, GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION, (guint8*)(out.data()),
+      synapinfer->recognition_items[0].bounding_box.origin.x, synapinfer->recognition_items[0].bounding_box.origin.y,
+      synapinfer->recognition_items[0].bounding_box.size.x, synapinfer->recognition_items[0].bounding_box.size.y,
+      GST_VIDEO_INFO_WIDTH (&synapinfer->videoinfo),
+      GST_VIDEO_INFO_HEIGHT (&synapinfer->videoinfo));
+
+  return TRUE;
+}
+
+static gboolean
+gst_synap_infer_head_pose (const Rect& face_rect, const std::vector<Dim2d>& landmarks)
+{
+  if (face_rect.origin.x < 0 || face_rect.origin.y < 0 ||
+      face_rect.size.x <= 0 || face_rect.size.y <= 0) {
+    return FALSE;
+  }
+
+  std::vector<gdouble> x_coords;
+  std::vector<gdouble> rotated_x;
+  std::vector<gdouble> y_coords;
+  std::vector<gdouble> rotated_y;
+
+  for (const auto& point : landmarks) {
+    x_coords.push_back(point.x);
+    y_coords.push_back(point.y);
+  }
+
+  gdouble eye_dx = (x_coords[1] - x_coords[0]) > 1
+    ? (x_coords[1] - x_coords[0]) : 1;
+  gdouble eye_dy = y_coords[1] - y_coords[0];
+  gdouble angle = atan2(eye_dy, eye_dx);
+  gdouble cos_a = cos(angle);
+  gdouble sin_a = sin(angle);
+
+  for (guint i = 0; i < 5; i++) {
+    gdouble temp_x = cos_a * x_coords[i] + sin_a * y_coords[i] + (1 - cos_a) *
+      x_coords[2] / 2 - sin_a * y_coords[2] / 2;
+    gdouble temp_y = -sin_a * x_coords[i] + cos_a * y_coords[i] + sin_a *
+      x_coords[2] / 2 + (1 - cos_a) * y_coords[2] / 2;
+    rotated_x.push_back(temp_x);
+    rotated_y.push_back(temp_y);
+  }
+
+  gdouble total_dx = (rotated_x[1] - rotated_x[0] + rotated_x[4] - rotated_x[3]) / 2;
+  gdouble total_dy = (rotated_y[3] - rotated_y[0] + rotated_y[4] - rotated_y[1]) / 2;
+  gdouble nose_dx = (rotated_x[1] - rotated_x[2] + rotated_x[4] - rotated_x[2]) / 2;
+  gdouble nose_dy = (rotated_y[3] - rotated_y[2] + rotated_y[4] - rotated_y[2]) / 2;
+
+  gdouble yaw = 0;
+  if (total_dx) {
+    yaw = -90 + 90 / 0.5 * nose_dx / total_dx;
+  }
+
+  gdouble pitch = 0;
+  if (total_dy) {
+    pitch = -90 + 90 / 0.5 * nose_dy / total_dy;
+  }
+
+  gdouble roll = angle * 180 / M_PI;
+
+  if (roll < -50 || roll > 50 || yaw < -200 || yaw > 200 || pitch < -30 || pitch > 30) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static cv::Mat
+gst_synap_infer_get_affine_transform (const vector<Dim2d>& src_points)
+{
+  static float dst_points[5][2] = {
+    {30.2946f + 8.0f, 51.6963f},
+    {65.5318f + 8.0f, 51.5014f},
+    {48.0252f + 8.0f, 71.7366f},
+    {33.5493f + 8.0f, 92.3655f},
+    {62.7299f + 8.0f, 92.2041f}
+  };
+
+  static const cv::Mat dst_mat (5, 2, CV_32FC1, dst_points);
+  float src_points_data[5][2] = {
+    {(float)src_points[0].x, (float)src_points[0].y},
+    {(float)src_points[1].x, (float)src_points[1].y},
+    {(float)src_points[2].x, (float)src_points[2].y},
+    {(float)src_points[3].x, (float)src_points[3].y},
+    {(float)src_points[4].x, (float)src_points[4].y}
+  };
+
+  cv::Mat src_mat (5, 2, CV_32FC1, src_points_data);
+  cv::Mat affine_transform = cv::estimateAffine2D (src_mat, dst_mat);
+  return affine_transform (cv::Rect (0, 0, 3, 2));
+}
+
+static InputData
+gst_synap_infer_align_face (const InputData& input_image, const Rect& face_rect,
+    const std::vector<Dim2d>& landmarks)
+{
+  if (input_image.empty()) return {};
+
+  Dimensions image_dim = input_image.dimensions();
+  if (!image_dim.w || !image_dim.h ||
+      face_rect.origin.x < 0 || face_rect.origin.y < 0 ||
+      face_rect.size.x <= 0 || face_rect.size.y <= 0) {
+    return {};
+  }
+
+  if (face_rect.origin.x + face_rect.size.x > image_dim.w ||
+      face_rect.origin.y + face_rect.size.y > image_dim.h) {
+    return {};
+  }
+
+  int image_type = CV_8UC3;
+  cv::Rect face_rect_cv(face_rect.origin.x, face_rect.origin.y,
+      face_rect.size.x, face_rect.size.y);
+  cv::Mat input_mat = cv::Mat(image_dim.h, image_dim.w, image_type,
+      (uint8_t *)input_image.data());
+  cv::Mat aligned_image;
+  uint32_t target_size = 112;
+  cv::Mat transform = gst_synap_infer_get_affine_transform(landmarks);
+  cv::warpAffine(input_mat, aligned_image, transform,
+      cv::Size(target_size, target_size), 1, 0, 0);
+
+  size_t aligned_image_size =
+    aligned_image.rows * aligned_image.cols * aligned_image.elemSize();
+  vector<uint8_t> aligned_image_buf(aligned_image.data,
+      aligned_image.data + aligned_image_size);
+  Shape aligned_shape = {1, aligned_image.rows, aligned_image.cols, 3};
+  InputData aligned_data(std::move(aligned_image_buf),
+      InputType::image_8bits, aligned_shape);
+  return aligned_data;
+}
+
+static InputData
+gst_synap_infer_recognize_face (GstSynapInfer *infer, const InputData& input_image,
+    const Rect& face_rect, const std::vector<Dim2d>& landmarks)
+{
+  if (input_image.empty()) {
+    return {};
+  }
+
+  const Dimensions image_dim = input_image.dimensions();
+  if (!image_dim.w || !image_dim.h ||
+      face_rect.origin.x < 0 || face_rect.origin.y < 0 ||
+      face_rect.size.x <= 0 || face_rect.size.y <= 0) {
+    return {};
+  }
+
+  if (face_rect.origin.x + face_rect.size.x > image_dim.w ||
+      face_rect.origin.y + face_rect.size.y > image_dim.h) {
+    return {};
+  }
+
+  float eye_distance =
+    hypot(landmarks[0].x - landmarks[1].x, landmarks[0].y - landmarks[1].y);
+  float mouth_to_eye_distance =
+    hypot(landmarks[4].x - landmarks[1].x, landmarks[4].y - landmarks[1].y);
+  if ((eye_distance / mouth_to_eye_distance) <=
+      GST_SYNAP_DEFAULT_SIDE_FACE_THRESHOLD_RECOGNITION ||
+      (eye_distance / mouth_to_eye_distance) > 1) {
+    return {};
+  }
+
+  if (!gst_synap_infer_head_pose(face_rect, landmarks)) {
+    return {};
+  }
+
+  InputData aligned_face =
+    gst_synap_infer_align_face(input_image, face_rect, landmarks);
+  if (aligned_face.empty()) {
+    return {};
+  }
+
+  return aligned_face;
 }

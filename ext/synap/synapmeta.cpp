@@ -60,30 +60,109 @@ gst_synap_meta_get_info (void)
 }
 
 /**
- * gst_buffer_add_synap_meta:
+ * gst_buffer_add_classifier_synap_meta:
  * @buffer: (transfer none): #GstBuffer holding synap text, to which
  * synap metadata should be added.
  * @regions: (transfer full): A #GPtrArray of #GstSynapRegions.
  *
- * Attaches synap metadata to a #GstBuffer.
+ * Attaches synap metadata with classifications to a #GstBuffer.
  *
  * Returns: A pointer to the added #GstSynapMeta if successful; %NULL if
  * unsuccessful.
  */
 GstSynapMeta *
-gst_buffer_add_synap_meta (GstBuffer * buffer, gpointer data,
-    GstSynapPostProcessingMode postproc_mode, gint width, gint height, gfloat confthreshold)
+gst_buffer_add_classifier_synap_meta (GstBuffer * buffer, GstSynapPostProcessingMode mode,
+    gpointer data, gint width, gint height, gfloat confthreshold)
 {
   GstSynapMeta *meta;
 
   g_return_val_if_fail (GST_IS_BUFFER (buffer), NULL);
 
   meta =
-      (GstSynapMeta *) gst_buffer_add_meta (buffer, GST_SYNAP_META_INFO, NULL);
-  meta->data = data;
-  meta->postproc_mode = postproc_mode;
-  meta->width = width;
-  meta->height = height;
-  meta->confthreshold = confthreshold;
+    (GstSynapMeta *) gst_buffer_add_meta (buffer, GST_SYNAP_META_INFO, NULL);
+  meta->mode = mode;
+  meta->type.classifier.data = data;
+  meta->type.classifier.width = width;
+  meta->type.classifier.height = height;
+  meta->type.classifier.confthreshold = confthreshold;
+
   return meta;
+}
+
+/**
+ * gst_buffer_add_detector_synap_meta:
+ * @buffer: (transfer none): #GstBuffer holding synap text, to which
+ * synap metadata should be added.
+ * @regions: (transfer full): A #GPtrArray of #GstSynapRegions.
+ *
+ * Attaches synap metadata with detections to a #GstBuffer.
+ *
+ * Returns: A pointer to the added #GstSynapMeta if successful; %NULL if
+ * unsuccessful.
+ */
+GstSynapMeta *
+gst_buffer_add_detector_synap_meta (GstBuffer * buffer, GstSynapPostProcessingMode mode,
+    gpointer data, gint width, gint height)
+{
+  GstSynapMeta *meta;
+
+  g_return_val_if_fail (GST_IS_BUFFER (buffer), NULL);
+
+  meta =
+    (GstSynapMeta *) gst_buffer_add_meta (buffer, GST_SYNAP_META_INFO, NULL);
+  meta->mode = mode;
+  meta->type.detector.data = data;
+  meta->type.detector.width = width;
+  meta->type.detector.height = height;
+
+  return meta;
+}
+
+/**
+ * gst_buffer_add_recognition_synap_meta:
+ * @buffer: (transfer none): #GstBuffer holding synap text, to which
+ * synap metadata should be added.
+ * @regions: (transfer full): A #GPtrArray of #GstSynapRegions.
+ *
+ * Attaches synap metadata with face embeddings to a #GstBuffer.
+ *
+ * Returns: A pointer to the added #GstSynapMeta if successful; %NULL if
+ * unsuccessful.
+ */
+GstSynapMeta *
+gst_buffer_add_recognition_synap_meta (GstBuffer * buffer, GstSynapPostProcessingMode mode,
+    gpointer data, gint tlx, gint tly, gint brx, gint bry,
+    gint width, gint height)
+{
+  GstSynapMeta *meta;
+
+  g_return_val_if_fail (GST_IS_BUFFER (buffer), NULL);
+
+  meta =
+    (GstSynapMeta *) gst_buffer_add_meta (buffer, GST_SYNAP_META_INFO, NULL);
+  meta->mode = mode;
+  meta->type.recognition.data = data;
+  meta->type.recognition.tlx = tlx;
+  meta->type.recognition.tly = tly;
+  meta->type.recognition.brx = brx;
+  meta->type.recognition.bry = bry;
+  meta->type.recognition.width = width;
+  meta->type.recognition.height = height;
+
+  return meta;
+}
+
+gboolean
+gst_buffer_remove_synap_meta (GstBuffer * buffer)
+{
+  GstMeta *meta;
+  g_return_val_if_fail (GST_IS_BUFFER (buffer), FALSE);
+
+  meta = gst_buffer_get_meta (buffer, GST_SYNAP_META_API_TYPE);
+
+  if (!gst_buffer_remove_meta (buffer, meta)) {
+    g_print ("Failed to remove metadata\n");
+  }
+
+  return TRUE;
 }

@@ -26,24 +26,49 @@ G_BEGIN_DECLS
 /**
  * @brief Synap Post-Processing Mode
  */
-    typedef enum
+typedef enum
 {
   GST_SYNAP_POSTPROCESSING_MODE_NONE = 0,               /**< Mode None */
   GST_SYNAP_POSTPROCESSING_MODE_CLASSIFIER = 1,         /**< Classification Mode */
   GST_SYNAP_POSTPROCESSING_MODE_DETECTOR = 2,           /**< Detection Mode */
+  GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION = 3,        /**< Recognition Mode */
 } GstSynapPostProcessingMode;
 
 typedef struct _GstSynapMeta GstSynapMeta;
 
-struct _GstSynapMeta
-{
+typedef struct {
   GstMeta meta;
-
-  GstSynapPostProcessingMode postproc_mode;
   gpointer data;
   gint width;
   gint height;
   gfloat confthreshold;
+} GstClassifierMeta;
+
+typedef struct {
+  GstMeta meta;
+  gpointer data;
+  gint width;
+  gint height;
+} GstDetectorMeta;
+
+typedef struct {
+  GstMeta meta;
+  gpointer data;
+  gint tlx;
+  gint tly;
+  gint brx;
+  gint bry;
+  gint width;
+  gint height;
+} GstRecognitionMeta;
+
+struct _GstSynapMeta {
+  GstSynapPostProcessingMode mode;
+  union {
+    GstClassifierMeta classifier;
+    GstDetectorMeta detector;
+    GstRecognitionMeta recognition;
+  } type;
 };
 
 GType gst_synap_meta_api_get_type (void);
@@ -61,9 +86,19 @@ void gst_synap_meta_free (GstMeta * meta, GstBuffer * buffer);
 
 const GstMetaInfo * gst_synap_meta_get_info (void);
 
-GstSynapMeta *gst_buffer_add_synap_meta (GstBuffer * buffer,
-    gpointer data, GstSynapPostProcessingMode postproc_mode,
+GstSynapMeta *gst_buffer_add_classifier_synap_meta (GstBuffer * buffer,
+    GstSynapPostProcessingMode mode, gpointer data,
     gint width, gint height, gfloat confthreshold);
+
+GstSynapMeta *gst_buffer_add_detector_synap_meta (GstBuffer * buffer,
+    GstSynapPostProcessingMode mode, gpointer data,
+    gint width, gint height);
+
+GstSynapMeta *gst_buffer_add_recognition_synap_meta (GstBuffer * buffer,
+    GstSynapPostProcessingMode mode, gpointer data, gint tlx, gint tly, gint brx, gint bry,
+    gint width, gint height);
+
+gboolean gst_buffer_remove_synap_meta (GstBuffer * buffer);
 
 G_END_DECLS
 

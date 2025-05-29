@@ -27,6 +27,8 @@
 #include "synap/classifier.hpp"
 #include "synap/detector.hpp"
 #include "synapmeta.h"
+#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
 
 using namespace std;
 using namespace synaptics::synap;
@@ -79,6 +81,8 @@ struct _GstSynapInfer
   Preprocessor *preprocessor;
   Classifier *classifier;
   Detector *detector;
+  vector<Detector::Result::Item> recognition_items;
+  InputData face_image;
 };
 
 struct _GstSynapInferClass

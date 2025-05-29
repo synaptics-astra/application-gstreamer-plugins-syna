@@ -23,7 +23,6 @@
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
 #include <gst/video/video.h>
-#include "synap/preprocessor.hpp"
 #include "synap/network.hpp"
 
 using namespace std;
@@ -44,8 +43,11 @@ struct _GstSynapImageProc
 {
   GstBaseTransform base_synapimageproc;
 
-  GstVideoInfo videoinfo;
-  GstVideoInfo videooutinfo;
+  GstVideoInfo in_videoinfo;
+  GstVideoInfo out_videoinfo;
+
+  GstVideoFormat in_format;
+  GstVideoFormat out_format;
 
   gint model_out_width, model_out_height;
   gint in_width, in_height;
@@ -56,7 +58,6 @@ struct _GstSynapImageProc
 
   /* SyNAP */
   Network *network;
-  Preprocessor *preprocessor;
   Allocator* allocator;
 };
 

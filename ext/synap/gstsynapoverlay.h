@@ -43,14 +43,10 @@ G_BEGIN_DECLS
 typedef struct _GstSynapOverlay GstSynapOverlay;
 typedef struct _GstSynapOverlayClass GstSynapOverlayClass;
 
-struct MetaQueue {
-  gpointer overlaydata;
-  GstSynapPostProcessingMode mode;
-  gint width;
-  gint height;
-  gfloat confthreshold;
+typedef struct {
+  GstSynapMeta synapmeta;
   GstClockTime pts;
-};
+} OverlayData;
 
 // Structure to store last stable classification
 typedef struct {
@@ -74,8 +70,8 @@ struct _GstSynapOverlay
   gint renderctrlPersistenceFrames;
 
   GstVideoInfo videoinfo;
-  MetaQueue metaQueue;
-  queue<MetaQueue> queue;
+  OverlayData overlay_data;
+  queue<OverlayData> queue;
   ClassificationState icState;
 
   /* SyNAP */

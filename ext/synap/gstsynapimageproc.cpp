@@ -33,7 +33,6 @@
  * </refsect2>
  */
 
-
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -77,14 +76,14 @@ static GstStaticPadTemplate gst_synap_image_proc_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12 }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12, I420 }"))
     );
 
 static GstStaticPadTemplate gst_synap_image_proc_sink_template =
 GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12 }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12, I420 }"))
     );
 
 /* class initialization */
@@ -231,9 +230,6 @@ gst_synap_image_proc_start (GstBaseTransform * trans)
   synapimageproc->network = new Network();
   g_return_val_if_fail (synapimageproc->network != NULL, FALSE);
 
-  synapimageproc->preprocessor = new Preprocessor();
-  g_return_val_if_fail (synapimageproc->preprocessor != NULL, FALSE);
-
   /* Load Model */
   if (!synapimageproc->network->load_model (synapimageproc->model, "")) {
     GST_ERROR ("Model cannot be loaded");
@@ -286,8 +282,6 @@ gst_synap_image_proc_stop (GstBaseTransform * trans)
 
   if (synapimageproc->network != NULL)
     delete synapimageproc->network;
-  if (synapimageproc->preprocessor != NULL)
-    delete synapimageproc->preprocessor;
   return TRUE;
 }
 
@@ -408,35 +402,39 @@ gst_synap_image_proc_set_caps (GstBaseTransform * trans, GstCaps * incaps,
   g_return_val_if_fail (synapimageproc != NULL, FALSE);
   g_return_val_if_fail (GST_IS_SYNAP_IMAGE_PROC (synapimageproc), FALSE);
 
-  if (!gst_video_info_from_caps (&synapimageproc->videoinfo, incaps))
+  if (!gst_video_info_from_caps (&synapimageproc->in_videoinfo, incaps))
     return FALSE;
 
-  if (!gst_video_info_from_caps (&synapimageproc->videooutinfo, outcaps))
+  if (!gst_video_info_from_caps (&synapimageproc->out_videoinfo, outcaps))
     return FALSE;
 
-  GstVideoInfo *info = &synapimageproc->videoinfo;
+  GstVideoInfo *info = &synapimageproc->in_videoinfo;
   synapimageproc->in_width = GST_VIDEO_INFO_WIDTH (info);
   synapimageproc->in_height = GST_VIDEO_INFO_HEIGHT (info);
 
-  info = &synapimageproc->videooutinfo;
+  info = &synapimageproc->out_videoinfo;
   synapimageproc->out_width = GST_VIDEO_INFO_WIDTH (info);
   synapimageproc->out_height = GST_VIDEO_INFO_HEIGHT (info);
 
-  GstVideoFormat format = GST_VIDEO_INFO_FORMAT (&synapimageproc->videoinfo);
-  if (format == GST_VIDEO_FORMAT_NV12) {
-    // NV12 and I420: Single channel with height * 3/2
+  synapimageproc->in_format = GST_VIDEO_INFO_FORMAT (&synapimageproc->in_videoinfo);
+  if (synapimageproc->in_format == GST_VIDEO_FORMAT_NV12) {
+    // NV12
+  } else if (synapimageproc->in_format == GST_VIDEO_FORMAT_I420) {
+    // I420
   } else {
     g_warning ("Unsupported input format for synapimageproc plugin: %d",
-        format);
+        synapimageproc->in_format);
     return FALSE;
   }
 
-  format = GST_VIDEO_INFO_FORMAT (&synapimageproc->videooutinfo);
-  if (format == GST_VIDEO_FORMAT_NV12) {
-    // NV12: Similar to I420, with width x height * 3/2
+  synapimageproc->out_format = GST_VIDEO_INFO_FORMAT (&synapimageproc->out_videoinfo);
+  if (synapimageproc->out_format == GST_VIDEO_FORMAT_NV12) {
+    // NV12
+  } else if (synapimageproc->out_format == GST_VIDEO_FORMAT_I420) {
+    // I420
   } else {
     g_warning ("Unsupported output format for synapimageproc plugin: %d",
-        format);
+        synapimageproc->out_format);
     return FALSE;
   }
 
@@ -492,27 +490,50 @@ gst_synap_image_proc_transform (GstBaseTransform * trans,
   guint8 *out_data = (guint8 *)out_map_info.data;
 
   /* Process with SyNAP */
-  string roi_str = "";
-  Rect roi{};
-  if (!roi_str.empty() && !from_string(roi, roi_str)) {
-    GST_ERROR ("Error, invalid ROI rectangle");
+  Tensor* y{};
+  Tensor* uv{};
+
+  if (synapimageproc->network->inputs[0].format() == "y8"
+      && synapimageproc->network->inputs[1].format() == "uv8") {
+    y = &synapimageproc->network->inputs[0];
+    uv = &synapimageproc->network->inputs[1];
+  } else if (synapimageproc->network->inputs[1].format() == "y8"
+      && synapimageproc->network->inputs[0].format() == "uv8") {
+    y = &synapimageproc->network->inputs[1];
+    uv = &synapimageproc->network->inputs[0];
+  } else {
+    gst_buffer_unmap (inbuf, &in_map_info);
+    gst_buffer_unmap (outbuf, &out_map_info);
+    GST_ERROR ("Upscaling failed");
     return GST_FLOW_ERROR;
   }
 
-  synapimageproc->preprocessor->set_roi(roi);
-
-  Shape shape = { 1, GST_VIDEO_INFO_HEIGHT (&synapimageproc->videoinfo),
-    GST_VIDEO_INFO_WIDTH (&synapimageproc->videoinfo), 1};
-  InputData image (in_data, in_map_info.size, synaptics::synap::InputType::nv12,
-      shape, Layout::nhwc);
-  if (image.empty ()) {
-    GST_ERROR ("Error in assigning input data");
-    return GST_FLOW_ERROR;
-  }
-
-  if (!synapimageproc->preprocessor->assign(synapimageproc->network->inputs, image)) {
+  uint32_t size_in_y = synapimageproc->in_height * synapimageproc->in_width;
+  if (!y->assign(in_data, size_in_y)) {
     GST_ERROR ("Failed to assign data to input tensors");
     return GST_FLOW_ERROR;
+  }
+
+  if (synapimageproc->in_format == GST_VIDEO_FORMAT_NV12) {
+    if (!uv->assign(in_data + size_in_y, size_in_y / 2)) {
+      GST_ERROR ("Failed to assign data to input tensors");
+      return GST_FLOW_ERROR;
+    }
+  } else if (synapimageproc->in_format == GST_VIDEO_FORMAT_I420) {
+    uint8_t* in_u = in_data + size_in_y;
+    uint8_t* in_v = in_u + size_in_y / 4;
+
+    uint8_t* in_uv = new uint8_t[size_in_y/2];
+    for (int i = 0; i < size_in_y / 4; i++) {
+      in_uv[i * 2] = in_u[i];
+      in_uv[i * 2 + 1] = in_v[i];
+    }
+    if (!uv->assign(in_uv, size_in_y / 2)) {
+      GST_ERROR ("Failed to assign data to input tensors");
+      delete in_uv;
+      return GST_FLOW_ERROR;
+    }
+    delete in_uv;
   }
 
   /* Execute inference */
@@ -524,32 +545,38 @@ gst_synap_image_proc_transform (GstBaseTransform * trans,
   }
 
   /* Post Process output */
-  const Tensor* y{};
-  const Tensor* uv{};
   if (synapimageproc->network->outputs[0].format() == "y8"
       && synapimageproc->network->outputs[1].format() == "uv8") {
     y = &synapimageproc->network->outputs[0];
     uv = &synapimageproc->network->outputs[1];
-  }
-  else if (synapimageproc->network->outputs[1].format() == "y8"
+  } else if (synapimageproc->network->outputs[1].format() == "y8"
       && synapimageproc->network->outputs[0].format() == "uv8") {
     y = &synapimageproc->network->outputs[1];
     uv = &synapimageproc->network->outputs[0];
-  }
-  else {
+  } else {
     gst_buffer_unmap (inbuf, &in_map_info);
     gst_buffer_unmap (outbuf, &out_map_info);
     GST_ERROR ("Upscaling failed");
     return GST_FLOW_ERROR;
   }
 
-  const uint8_t* psrc_y = (uint8_t*)y->data();
-  const uint8_t* psrc_u = (uint8_t*)uv->data();
+  const uint8_t* out_y = (uint8_t*)y->data();
+  const uint8_t* out_uv = (uint8_t*)uv->data();
 
-  uint32_t size_y = synapimageproc->out_height * synapimageproc->out_width;
-
-  memcpy(out_data, psrc_y, size_y);
-  memcpy(out_data + size_y, psrc_u, size_y / 2);
+  if (out_y != nullptr && out_uv != nullptr) {
+    uint32_t size_out_y = synapimageproc->out_height * synapimageproc->out_width;
+    memcpy(out_data, out_y, size_out_y);
+    if (synapimageproc->out_format == GST_VIDEO_FORMAT_NV12) {
+      memcpy(out_data + size_out_y, out_uv, size_out_y / 2);
+    } else if (synapimageproc->out_format == GST_VIDEO_FORMAT_I420) {
+      uint8_t* out_u = out_data + size_out_y;
+      uint8_t* out_v = out_u + size_out_y / 4;
+      for (int i = 0; i < size_out_y / 4; i++) {
+        out_u[i] = out_uv[i * 2];
+        out_v[i] = out_uv[i * 2 + 1];
+      }
+    }
+  }
 
   gst_buffer_unmap(inbuf, &in_map_info);
   gst_buffer_unmap(outbuf, &out_map_info);
