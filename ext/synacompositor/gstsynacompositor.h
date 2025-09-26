@@ -33,8 +33,12 @@
 #include <gst/allocators/gstfdmemory.h>
 #include <gst/video/gstvideometa.h>
 #include <gst/video/gstvideopool.h>
+#include <gst/gstmemory.h>
+#include <gst/gstminiobject.h>
 
 G_BEGIN_DECLS
+
+#define MAX_SINKS 25
 
 #define GST_TYPE_SYNACOMPOSITOR (gst_synacompositor_get_type())
 G_DECLARE_FINAL_TYPE(GstSynaCompositor, gst_synacompositor, GST, SYNACOMPOSITOR,
@@ -44,6 +48,10 @@ G_DECLARE_FINAL_TYPE(GstSynaCompositor, gst_synacompositor, GST, SYNACOMPOSITOR,
 G_DECLARE_FINAL_TYPE(GstSynaCompositorPad, gst_synacompositor_pad, GST,
                      SYNACOMPOSITOR_PAD, GstVideoAggregatorPad)
 
+typedef struct {
+  DRMBuffer *buffer;
+  int inUse;
+} BufferEntry;
 /**
  * GstSynaCompositor:
  *
@@ -51,12 +59,17 @@ G_DECLARE_FINAL_TYPE(GstSynaCompositorPad, gst_synacompositor_pad, GST,
  */
 struct _GstSynaCompositor {
   GstVideoAggregator videoaggregator;
-  SynaCompositor synaCompositor;
-  EGLManager eglManager;
-  DRMBuffer outputBuffer;
+  SynaCompositor* synaCompositor;
+  EGLManager* eglManager;
+  std::vector<BufferEntry*> outputBufferPool;
+  DRMBuffer* outputBuffer;
+  EGLImageKHR outputImage;
+  GBMManagerPtr gbmManager;
   gdouble width, height;
   guint background;
   guint numPads;
+  bool isOutputDMAMemory;
+  bool checkedSrcCaps;
 };
 
 /**
@@ -66,9 +79,17 @@ struct _GstSynaCompositor {
  */
 struct _GstSynaCompositorPad {
   GstVideoAggregatorPad parent;
+  GstCaps *cached_caps;
+  gboolean flushing;
+  gboolean need_caps_resent;
+  gboolean received_eos;
 
   /* properties */
   LayoutItem layoutItem;
+
+  /* Pad Buffers */
+  DRMBuffer* inputBuffer;   /* To use in case input memory is not DMABUF */
+  EGLImageKHR inputImage;
 };
 
 GST_ELEMENT_REGISTER_DECLARE(synacompositor);

@@ -79,8 +79,8 @@ static gboolean gst_synap_infer_postproc_detector (GstBaseTransform * trans,
     GstBuffer * buf);
 static gboolean gst_synap_infer_preproc_recognition (GstBaseTransform * trans,
     GstBuffer * buf, InputData &image);
-static gboolean gst_synap_infer_postproc_recognition (GstBaseTransform * trans,
-    GstBuffer * buf);
+static gboolean gst_synap_infer_embeddingproc_recognition (GstBaseTransform * trans,
+    GstBuffer * buf, InputData &image);
 
 static gboolean gst_synap_infer_head_pose (const Rect& face_rect,
     const std::vector<Dim2d>& landmarks);
@@ -537,11 +537,6 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
       gst_buffer_unmap (buf, &map);
       return GST_FLOW_OK;
     }
-    if (!synapinfer->preprocessor->assign (synapinfer->network->inputs, synapinfer->face_image, 0,
-          &assigned_rect)) {
-      GST_ERROR ("Error assigning input to tensor");
-      return GST_FLOW_ERROR;
-    }
   }
 
   /* Track time for inference */
@@ -551,10 +546,12 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   }
 
   /* Execute inference */
-  if (!synapinfer->network->predict ()) {
-    gst_buffer_unmap (buf, &map);
-    GST_ERROR ("Inference failed");
-    return GST_FLOW_ERROR;
+  if (synapinfer->postproc_mode != GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION) {
+    if (!synapinfer->network->predict ()) {
+      gst_buffer_unmap (buf, &map);
+      GST_ERROR ("Inference failed");
+      return GST_FLOW_ERROR;
+    }
   }
   gst_buffer_unmap (buf, &map);
 
@@ -571,7 +568,7 @@ gst_synap_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   } else if (synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
     postproc_result = gst_synap_infer_postproc_detector (trans, buf);
   } else if (synapinfer->postproc_mode == GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION) {
-    postproc_result = gst_synap_infer_postproc_recognition (trans, buf);
+    postproc_result = gst_synap_infer_embeddingproc_recognition (trans, buf, image);
   }
   return (postproc_result ? GST_FLOW_OK : GST_FLOW_ERROR);
 }
@@ -695,29 +692,39 @@ gst_synap_infer_preproc_recognition (GstBaseTransform * trans, GstBuffer * buf, 
       });
 
   synapinfer->recognition_items.clear();
-  synapinfer->recognition_items.push_back(result->items[bounding_box_areas[0].first]);
-  auto detected_item = synapinfer->recognition_items[0];
-  std::vector<Dim2d> landmarks_2d;
-  landmarks_2d.reserve(detected_item.landmarks.size());
-  std::transform(detected_item.landmarks.begin(), detected_item.landmarks.end(),
-      std::back_inserter(landmarks_2d), [](const Landmark& landmark) {
-      return Dim2d{landmark.x, landmark.y};
-      });
-
-  synapinfer->face_image =
-    gst_synap_infer_recognize_face(synapinfer, image,
-        detected_item.bounding_box, landmarks_2d);
+  int total_size = 0;
+  int j = 0;
+  int max_size = bounding_box_areas.size();
+  for (int i = 0; i < max_size; i++) {
+    const auto& bounding_box = result->items[bounding_box_areas[i].first].bounding_box;
+    double bounding_box_area = bounding_box.size.x * bounding_box.size.y;
+    if (result->items[bounding_box_areas[i].first].confidence > 0.80 && bounding_box_area > 800) {
+      synapinfer->recognition_items.push_back(result->items[bounding_box_areas[i].first]);
+      auto detected_item = synapinfer->recognition_items[j];
+      j += 1;
+      total_size += detected_item.landmarks.size();
+      synapinfer->detected_item_collection.push_back(detected_item);
+    }
+  }
+  synapinfer->landmarks_2d_collection.reserve(total_size);
+  max_size = synapinfer->detected_item_collection.size();
+  for (int i = 0; i < max_size; i++) {
+    std::vector<Dim2d> landmarks_2d;
+    auto detected_item = synapinfer->recognition_items[i];
+    std::transform(detected_item.landmarks.begin(), detected_item.landmarks.end(),
+        std::back_inserter(landmarks_2d), [](const Landmark& landmark) {
+        return Dim2d{landmark.x, landmark.y};
+        });
+    synapinfer->landmarks_2d_collection.push_back(landmarks_2d);
+  }
 
   delete result;
-  if (synapinfer->face_image.empty()) {
-    return FALSE;
-  }
 
   return TRUE;
 }
 
 static gboolean
-gst_synap_infer_postproc_recognition (GstBaseTransform * trans, GstBuffer * buf)
+gst_synap_infer_embeddingproc_recognition (GstBaseTransform * trans, GstBuffer * buf, InputData &image)
 {
   GstSynapInfer *synapinfer = GST_SYNAP_INFER (trans);
 
@@ -725,16 +732,53 @@ gst_synap_infer_postproc_recognition (GstBaseTransform * trans, GstBuffer * buf)
   g_return_val_if_fail (synapinfer != NULL, FALSE);
   g_return_val_if_fail (GST_IS_SYNAP_INFER (synapinfer), FALSE);
 
-  Tensor& out = synapinfer->network->outputs[0];
+  GArray* origin_x = g_array_new(FALSE,FALSE, sizeof(gint));
+  GArray* origin_y = g_array_new(FALSE,FALSE, sizeof(gint));
+  GArray* size_x = g_array_new(FALSE,FALSE, sizeof(gint));
+  GArray* size_y = g_array_new(FALSE,FALSE, sizeof(gint));
+
+  Rect assigned_rect;
+  GArray *out_collection = g_array_new(FALSE,FALSE, sizeof(guint8*));
+  int max_size = synapinfer->detected_item_collection.size();
+  for (int i = 0; i < max_size ; i++) {
+    synapinfer->face_image = gst_synap_infer_recognize_face(synapinfer, image,
+      synapinfer->detected_item_collection[i].bounding_box, synapinfer->landmarks_2d_collection[i]);
+    if (!synapinfer->face_image.empty()) {
+      if (!synapinfer->preprocessor->assign (synapinfer->network->inputs, synapinfer->face_image, 0,&assigned_rect)) {
+        GST_ERROR ("Error assigning input to tensor");
+        return FALSE;
+      }
+      if (!synapinfer->network->predict ()) {
+        GST_ERROR ("Inference failed");
+        return FALSE;
+      }
+      Tensor& out = synapinfer->network->outputs[0];
+      guint8* original = (guint8*)out.data();
+      gsize size = out.size();
+      guint8* copy = (guint8*)(g_memdup2(original, size));
+      g_array_append_val(out_collection, copy);
+
+      g_array_append_val(origin_x, synapinfer->recognition_items[i].bounding_box.origin.x);
+      g_array_append_val(origin_y, synapinfer->recognition_items[i].bounding_box.origin.y);
+      g_array_append_val(size_x, synapinfer->recognition_items[i].bounding_box.size.x);
+      g_array_append_val(size_y, synapinfer->recognition_items[i].bounding_box.size.y);
+     }
+  }
+  synapinfer->landmarks_2d_collection.clear();
+  synapinfer->detected_item_collection.clear();
+  synapinfer->landmarks_2d_collection.shrink_to_fit();
+  synapinfer->detected_item_collection.shrink_to_fit();
+  if (out_collection->len == 0 ) {
+    return TRUE;
+  }
 
   if (!gst_buffer_remove_synap_meta (buf)) {
     GST_ERROR ("Failed to remove the metadata from the buffer: %p", buf);
     return FALSE;
   }
 
-  gst_buffer_add_recognition_synap_meta (buf, GST_SYNAP_POSTPROCESSING_MODE_RECOGNITION, (guint8*)(out.data()),
-      synapinfer->recognition_items[0].bounding_box.origin.x, synapinfer->recognition_items[0].bounding_box.origin.y,
-      synapinfer->recognition_items[0].bounding_box.size.x, synapinfer->recognition_items[0].bounding_box.size.y,
+  gst_buffer_add_recognition_synap_meta (buf, synapinfer->postproc_mode,
+      out_collection, origin_x, origin_y, size_x, size_y,
       GST_VIDEO_INFO_WIDTH (&synapinfer->videoinfo),
       GST_VIDEO_INFO_HEIGHT (&synapinfer->videoinfo));
 

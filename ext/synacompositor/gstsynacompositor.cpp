@@ -69,13 +69,12 @@ G_DEFINE_TYPE(GstSynaCompositorPad, gst_synacompositor_pad,
               GST_TYPE_VIDEO_AGGREGATOR_PAD);
 
 #define SRC_COLOR_FORMATS "{ BGRA }"
-#define SINK_COLOR_FORMAT "{ NV12, NV12M }"
+#define SINK_COLOR_FORMAT "{ NV12, NV12M, I420, YUY2, UYVY, BGRA }"
 #define DEFAULT_PAD_XPOS 0.0
 #define DEFAULT_PAD_YPOS 0.0
 #define DEFAULT_PAD_ZORDER 0.0
 #define DEFAULT_PAD_WIDTH 0.0
 #define DEFAULT_PAD_HEIGHT 0.0
-#define DEFAULT_PAD_ALPHA 1.0
 
 enum {
   PROP_PAD_0,
@@ -84,7 +83,6 @@ enum {
   PROP_PAD_ZORDER,
   PROP_PAD_WIDTH,
   PROP_PAD_HEIGHT,
-  PROP_PAD_ALPHA,
 };
 
 enum {
@@ -92,6 +90,7 @@ enum {
   PROP_BACKGROUND,
   PROP_COMP_WIDTH,
   PROP_COMP_HEIGHT,
+  PROP_DRM_ADDRESS
 };
 
 static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE(
@@ -133,6 +132,134 @@ void memcpy_neon(void *dst, const void *src, size_t len) {
                : "q0", "q1", "x0", "x1");
 }
 
+static gboolean create_egl_image_from_gst_buffer(GstVideoAggregatorPad *pad,
+                                                 GstVideoAggregator *vagg,
+                                                 GstBuffer *inBuffer,
+                                                 PixelFormat pFormat) {
+  GstSynaCompositor *self = GST_SYNACOMPOSITOR(vagg);
+  GstSynaCompositorPad *self_pad = GST_SYNACOMPOSITOR_PAD(pad);
+  GstVideoMeta *vmeta = gst_buffer_get_video_meta(inBuffer);
+  guint n_mem = gst_buffer_n_memory(inBuffer);
+  std::array<int32_t, GBM_MAX_PLANES> sharedFDs;
+  sharedFDs.fill(-1);
+
+  if (gst_is_dmabuf_memory(gst_buffer_peek_memory(inBuffer, 0))) {
+    for (guint i = 0; i < n_mem; i++) {
+      sharedFDs[i] =
+          gst_dmabuf_memory_get_fd(gst_buffer_peek_memory(inBuffer, i));
+    }
+  } else {
+    GstCaps *caps = gst_pad_get_current_caps(GST_PAD_CAST(pad));
+    if (!caps) {
+      GST_ERROR_OBJECT(pad, "No caps available");
+      return FALSE;
+    }
+
+    GstVideoInfo info;
+    if (!gst_video_info_from_caps(&info, caps)) {
+      GST_ERROR_OBJECT(pad, "Failed to get video info from caps");
+      return FALSE;
+    }
+
+    GstVideoFrame src_frame;
+    if (!gst_video_frame_map(&src_frame, &info, inBuffer, GST_MAP_READ)) {
+      GST_ERROR_OBJECT(pad, "Failed to map input buffer as video frame");
+      return FALSE;
+    }
+
+    if (self_pad->inputBuffer == nullptr) {
+      self_pad->inputBuffer = new DRMBuffer(self->gbmManager);
+      if (self_pad->inputBuffer->createBuffer(vmeta->width, vmeta->height,
+                                              pFormat) < 0) {
+        GST_ERROR_OBJECT(self, "Intermediate DMA Buffer creation failed.");
+        return FALSE;
+      }
+    }
+
+    if (self_pad->inputBuffer->getNumPlanes() != vmeta->n_planes) {
+      GST_ERROR_OBJECT(self_pad, "Plane Mismatch "
+                "Expected - %d, Actual - %d\n",
+                self_pad->inputBuffer->getNumPlanes(), vmeta->n_planes);
+      return FALSE;
+    }
+
+    const std::array<SharedPlane, GBM_MAX_PLANES> sharedPlane =
+        self_pad->inputBuffer->getSharedPlanes();
+
+    for (guint i = 0; i < vmeta->n_planes; i++) {
+      uint8_t *src = (uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&src_frame, i);
+      memcpy_neon(sharedPlane[i].virtualAddress, src, sharedPlane[i].size);
+      sharedFDs[i] = sharedPlane[i].fd;
+    }
+
+    gst_video_frame_unmap(&src_frame);
+  }
+
+  if (self->eglManager->createImageKHR(sharedFDs, self_pad->inputImage,
+                                       vmeta->width, vmeta->height, pFormat,
+                                       TRUE) < 0) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_synacompositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
+    GstVideoAggregator * vagg, GstBuffer * buffer,
+    GstVideoFrame * prepared_frame)
+{
+  PixelFormat pFormat;
+  guint n_mem = gst_buffer_n_memory(buffer);
+  GstVideoMeta *vmeta = gst_buffer_get_video_meta(buffer);
+
+  switch (vmeta->format) {
+    case GST_VIDEO_FORMAT_NV12:
+      if (gst_is_dmabuf_memory(gst_buffer_peek_memory(buffer, 0))) {
+        if (n_mem > 1)
+          pFormat = NV12M;
+        else
+          pFormat = NV12;
+      } else
+          pFormat = NV12M;
+      break;
+
+    case GST_VIDEO_FORMAT_I420:
+      pFormat = I420;
+      break;
+
+    case GST_VIDEO_FORMAT_YUY2:
+      pFormat = YUY2;
+      break;
+
+    case GST_VIDEO_FORMAT_UYVY:
+      pFormat = UYVY;
+      break;
+
+    case GST_VIDEO_FORMAT_BGRA:
+      pFormat = ARGB;
+      break;
+
+    default:
+      GST_ERROR_OBJECT(pad, "Unsupported video format: %s (%d)",
+                      gst_video_format_to_string(vmeta->format), vmeta->format);
+      return FALSE;
+  }
+
+  if (!(create_egl_image_from_gst_buffer(pad, vagg, buffer, pFormat)))
+    return FALSE;
+
+  return TRUE;
+}
+
+static void
+gst_synacompositor_pad_clean_frame (GstVideoAggregatorPad * pad,
+    GstVideoAggregator * vagg, GstVideoFrame * prepared_frame)
+{
+  /* No cleaning required */
+}
+
+
 static void gst_synacompositor_pad_get_property(GObject *object, guint prop_id,
                                                 GValue *value,
                                                 GParamSpec *pspec) {
@@ -152,9 +279,6 @@ static void gst_synacompositor_pad_get_property(GObject *object, guint prop_id,
       break;
     case PROP_PAD_HEIGHT:
       g_value_set_double(value, pad->layoutItem.height);
-      break;
-    case PROP_PAD_ALPHA:
-      g_value_set_double(value, pad->layoutItem.alpha);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -182,9 +306,6 @@ static void gst_synacompositor_pad_set_property(GObject *object, guint prop_id,
     case PROP_PAD_HEIGHT:
       pad->layoutItem.height = g_value_get_double(value);
       break;
-    case PROP_PAD_ALPHA:
-      pad->layoutItem.alpha = g_value_get_double(value);
-      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -194,9 +315,11 @@ static void gst_synacompositor_pad_set_property(GObject *object, guint prop_id,
 static void
 gst_synacompositor_pad_class_init(GstSynaCompositorPadClass *klass) {
   GObjectClass *gobject_class = (GObjectClass *)klass;
-
+  GstVideoAggregatorPadClass *vaggpad_class = (GstVideoAggregatorPadClass*)klass;
   gobject_class->set_property = gst_synacompositor_pad_set_property;
   gobject_class->get_property = gst_synacompositor_pad_get_property;
+  vaggpad_class->prepare_frame = gst_synacompositor_pad_prepare_frame;
+  vaggpad_class->clean_frame = gst_synacompositor_pad_clean_frame;
 
   g_object_class_install_property(
       gobject_class, PROP_PAD_XPOS,
@@ -213,7 +336,7 @@ gst_synacompositor_pad_class_init(GstSynaCompositorPadClass *klass) {
   g_object_class_install_property(
       gobject_class, PROP_PAD_ZORDER,
       g_param_spec_double(
-          "zorder", "Z Order", "Z Order of the picture", -1.0, 1.0, 0.0,
+          "zorder", "Z Order", "Z Order of the picture", 0.0, 100.0, 0.0,
           (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_CONTROLLABLE |
                         G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
@@ -228,12 +351,6 @@ gst_synacompositor_pad_class_init(GstSynaCompositorPadClass *klass) {
           "height", "Height", "Height of the picture", 0.0, 2160.0, 0.0,
           (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_CONTROLLABLE |
                         G_PARAM_STATIC_STRINGS)));
-  g_object_class_install_property(
-      gobject_class, PROP_PAD_ALPHA,
-      g_param_spec_double(
-          "alpha", "Alpha", "Alpha of the picture", 0.0, 1.0, DEFAULT_PAD_ALPHA,
-          (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_CONTROLLABLE |
-                        G_PARAM_STATIC_STRINGS)));
 }
 
 static void gst_synacompositor_pad_init(GstSynaCompositorPad *compo_pad) {
@@ -244,7 +361,9 @@ static void gst_synacompositor_pad_init(GstSynaCompositorPad *compo_pad) {
   compo_pad->layoutItem.zPos = DEFAULT_PAD_ZORDER;
   compo_pad->layoutItem.width = DEFAULT_PAD_WIDTH;
   compo_pad->layoutItem.height = DEFAULT_PAD_HEIGHT;
-  compo_pad->layoutItem.alpha = DEFAULT_PAD_ALPHA;
+  compo_pad->inputBuffer = nullptr;
+  compo_pad->inputImage = EGL_NO_IMAGE_KHR;
+  compo_pad->received_eos = FALSE;
   padIndex++;
 }
 
@@ -316,13 +435,8 @@ static GstCaps *gst_synacompositor_fixate_caps(GstAggregator *agg,
   GST_OBJECT_LOCK(vagg);
   for (l = GST_ELEMENT(vagg)->sinkpads; l; l = l->next) {
     GstVideoAggregatorPad *vaggpad = (GstVideoAggregatorPad *)l->data;
-    GstSynaCompositorPad *synacompositor_pad = GST_SYNACOMPOSITOR_PAD(vaggpad);
-    gint this_width, this_height;
-    gint width, height;
     gint fps_n, fps_d;
     gdouble cur_fps;
-    gint x_offset;
-    gint y_offset;
 
     if (gst_aggregator_pad_is_inactive(GST_AGGREGATOR_PAD(vaggpad)))
       continue;
@@ -349,8 +463,8 @@ static GstCaps *gst_synacompositor_fixate_caps(GstAggregator *agg,
     best_fps = 25.0;
   }
 
-  gst_structure_fixate_field_nearest_int(s, "width", 1920);
-  gst_structure_fixate_field_nearest_int(s, "height", 1080);
+  gst_structure_fixate_field_nearest_int(s, "width", best_width);
+  gst_structure_fixate_field_nearest_int(s, "height", best_height);
   gst_structure_fixate_field_nearest_fraction(s, "framerate", best_fps_n,
                                               best_fps_d);
   ret = gst_caps_fixate(ret);
@@ -363,26 +477,37 @@ static gboolean gst_synacompositor_start(GstAggregator *agg) {
   GList *l;
   int layoutIndex = 0;
 
-  self->eglManager.setPixelFormat(ARGB);
-  self->eglManager.initializeEGLDisplay("/dev/dri/card0");
-  self->synaCompositor.setScreenDimensions(self->width, self->height);
+  if (self->gbmManager == nullptr)
+    self->gbmManager = std::make_shared<GBMManager>();
+
+  if (self->synaCompositor == nullptr)
+    self->synaCompositor = new SynaCompositor();
+
+  if (self->eglManager == nullptr)
+    self->eglManager = new EGLManager(self->gbmManager);
 
   /* Register Composition Layout */
   for (l = GST_ELEMENT(self)->sinkpads; l; l = l->next) {
     GstSynaCompositorPad *pad = (GstSynaCompositorPad *)l->data;
     pad->layoutItem.index = layoutIndex;
-    self->synaCompositor.registerCompositorLayoutItems({pad->layoutItem});
+    self->synaCompositor->registerCompositorLayoutItems({pad->layoutItem});
+
+    /* Calculate Output Window Dimensions */
+    self->width =
+        MAX(self->width, (pad->layoutItem.xPos + pad->layoutItem.width));
+    self->height =
+        MAX(self->height, (pad->layoutItem.yPos + pad->layoutItem.height));
     layoutIndex++;
   }
 
   /* Initialize Compositor */
-  glViewport(0, 0, self->width, self->height);
-  self->synaCompositor.initializeCompositor();
-  self->outputBuffer.createBuffer(self->eglManager.getGBMDevice(), self->width,
-                                  self->height, GBM_FORMAT_ARGB8888);
+  self->synaCompositor->setScreenDimensions(self->width, self->height);
+  self->synaCompositor->setBackgroundColor(self->background);
+  self->synaCompositor->initializeCompositor();
+  self->synaCompositor->startRendering();
 
   /* Free EGL Context from thread */
-  if (!eglMakeCurrent(self->eglManager.getDisplay(), EGL_NO_SURFACE,
+  if (!eglMakeCurrent(self->eglManager->getDisplay(), EGL_NO_SURFACE,
                       EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
     EGLint error = eglGetError();
     GST_ERROR_OBJECT(self, "eglMakeCurrent failed! EGL error: 0x%04x\n", error);
@@ -392,7 +517,21 @@ static gboolean gst_synacompositor_start(GstAggregator *agg) {
 }
 
 static gboolean gst_synacompositor_stop(GstAggregator *agg) {
-  /* TBD */
+  GstSynaCompositor *self = GST_SYNACOMPOSITOR(agg);
+
+  self->synaCompositor->stopRendering();
+
+  self->eglManager->destroyImageKHR(self->outputImage);
+
+  if (self->outputBuffer)
+    delete self->outputBuffer;
+
+  for (auto &entry : self->outputBufferPool) {
+    delete entry->buffer;
+    delete entry;
+  }
+  self->outputBufferPool.clear();
+
   return GST_AGGREGATOR_CLASS(gst_synacompositor_parent_class)->stop(agg);
 }
 
@@ -402,11 +541,20 @@ static GstPad *gst_synacompositor_request_new_pad(GstElement *element,
                                                   const GstCaps *caps) {
   GstPad *newpad;
 
+  GstSynaCompositor *self = GST_SYNACOMPOSITOR(element);
+
+  if (self->numPads >= MAX_SINKS) {
+    GST_ERROR_OBJECT(self, "Maximum number of sinks (%d) reached", MAX_SINKS);
+    return NULL;
+  }
+
   newpad = (GstPad *)GST_ELEMENT_CLASS(gst_synacompositor_parent_class)
                ->request_new_pad(element, templ, req_name, caps);
 
   if (newpad == NULL)
     goto could_not_create;
+
+  self->numPads += 1;
 
   gst_child_proxy_child_added(GST_CHILD_PROXY(element), G_OBJECT(newpad),
                               GST_OBJECT_NAME(newpad));
@@ -421,11 +569,17 @@ could_not_create : {
 
 static void gst_synacompositor_release_pad(GstElement *element, GstPad *pad) {
   GstSynaCompositor *self = GST_SYNACOMPOSITOR(element);
+  GstSynaCompositorPad *self_pad = GST_SYNACOMPOSITOR_PAD(pad);
 
   GST_DEBUG_OBJECT(self, "release pad %s:%s", GST_DEBUG_PAD_NAME(pad));
 
+  if (self_pad->inputBuffer != nullptr)
+    delete self_pad->inputBuffer;
+
   gst_child_proxy_child_removed(GST_CHILD_PROXY(self), G_OBJECT(pad),
                                 GST_OBJECT_NAME(pad));
+
+  self->numPads -= 1;
 
   GST_ELEMENT_CLASS(gst_synacompositor_parent_class)->release_pad(element, pad);
 }
@@ -433,10 +587,11 @@ static void gst_synacompositor_release_pad(GstElement *element, GstPad *pad) {
 static gboolean gst_synacompositor_sink_query(GstAggregator *agg,
                                               GstAggregatorPad *bpad,
                                               GstQuery *query) {
-  GstVideoAggregator *vagg = GST_VIDEO_AGGREGATOR(agg);
   GstSynaCompositor *self = GST_SYNACOMPOSITOR(agg);
   GstVideoAggregatorPad *pad = GST_VIDEO_AGGREGATOR_PAD(bpad);
   gboolean ret = FALSE;
+  GstCaps *dmabuf_caps = gst_caps_from_string("video/x-raw(memory:DMABuf)");
+  GstCaps *raw_caps = gst_caps_from_string("video/x-raw");
 
   switch (GST_QUERY_TYPE(query)) {
     case GST_QUERY_CAPS: {
@@ -453,15 +608,11 @@ static gboolean gst_synacompositor_sink_query(GstAggregator *agg,
           break;
         }
 
-        if (gst_caps_can_intersect(
-                intersect, gst_caps_from_string(
-                              "video/x-raw(memory:DMABuf), width=(int)[1,1920], "
-                              "height=(int)[1,1080]"))) {
-          caps = gst_caps_intersect(
-              intersect,
-              gst_caps_from_string("video/x-raw(memory:DMABuf), "
-                                  "width=(int)[1,1920], height=(int)[1,1080]"));
-        } else {
+        if (gst_caps_can_intersect(intersect, dmabuf_caps)) {
+          caps = gst_caps_intersect(intersect, dmabuf_caps);
+        } else if (gst_caps_can_intersect(intersect, raw_caps)) {
+          caps = gst_caps_intersect(intersect, raw_caps);
+        } else{
           caps = gst_caps_ref(intersect);
         }
 
@@ -499,7 +650,6 @@ static gboolean gst_synacompositor_sink_query(GstAggregator *agg,
 
       gst_query_set_accept_caps_result(query, is_accepted);
       gst_caps_unref(pad_template_caps);
-      gst_caps_unref(caps);
 
       ret = TRUE;
       break;
@@ -514,7 +664,153 @@ static gboolean gst_synacompositor_sink_query(GstAggregator *agg,
   return ret;
 }
 
-static void gst_synacompositor_finalize(GObject *object) { /* TBD */
+static gboolean
+gst_synacompositor_sink_event (GstAggregator * agg, GstAggregatorPad * bpad,
+    GstEvent * event)
+{
+  GstSynaCompositor *self = GST_SYNACOMPOSITOR (agg);
+  GstSynaCompositorPad *pad = GST_SYNACOMPOSITOR_PAD (bpad);
+  gboolean ret = TRUE;
+
+  GST_DEBUG_OBJECT (pad, "Got %s event on pad %s:%s",
+      GST_EVENT_TYPE_NAME (event), GST_DEBUG_PAD_NAME (pad));
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_EOS:
+      GST_DEBUG_OBJECT (pad, "EOS received on pad %s:%s",
+          GST_DEBUG_PAD_NAME (pad));
+      self->synaCompositor->setActive(pad->layoutItem.index, false);
+      pad->received_eos = TRUE;
+      break;
+
+    default:
+      break;
+  }
+
+  if (event != NULL)
+    return GST_AGGREGATOR_CLASS (gst_synacompositor_parent_class)->sink_event
+        (agg, bpad, event);
+
+  return ret;
+}
+
+static void gst_synacompositor_finalize(GObject *object) {
+  GstSynaCompositor *self = GST_SYNACOMPOSITOR(object);
+
+  if (self->synaCompositor)
+    delete self->synaCompositor;
+
+  if (self->eglManager)
+    delete self->eglManager;
+
+  while (self->gbmManager.use_count() > 0) {
+    self->gbmManager.reset();
+  }
+
+  G_OBJECT_CLASS(gst_synacompositor_parent_class)->finalize(object);
+}
+
+GstFlowReturn
+gst_synacompositor_create_output_buffer(GstVideoAggregator *videoaggregator,
+                                        GstBuffer **outbuf) {
+  GstSynaCompositor *self = GST_SYNACOMPOSITOR(videoaggregator);
+
+  if (!self->checkedSrcCaps) {
+    GstPad *srcpad = GST_AGGREGATOR(videoaggregator)->srcpad;
+    GstCaps *caps = gst_pad_get_current_caps(srcpad);
+
+    if (caps) {
+      GstCapsFeatures *features = gst_caps_get_features(caps, 0);
+      if (features && gst_caps_features_contains(features, "memory:DMABuf")) {
+        self->isOutputDMAMemory = TRUE;
+      } else {
+        self->isOutputDMAMemory = FALSE;
+      }
+    } else {
+      self->isOutputDMAMemory = FALSE;
+    }
+    if (self->isOutputDMAMemory == FALSE) {
+      /* Fallback Output Buffer */
+      std::array<int32_t, GBM_MAX_PLANES> sharedFDs;
+      sharedFDs.fill(-1);
+      self->outputBuffer = new DRMBuffer(self->gbmManager);
+      self->outputBuffer->createBuffer(self->width, self->height,
+                                       ARGB);
+      sharedFDs[0] = self->outputBuffer->getSharedPlanes()[0].fd;
+      self->eglManager->createImageKHR(sharedFDs, self->outputImage,
+                                       self->width, self->height, ARGB, true);
+      self->synaCompositor->setOutputTextureImage(self->outputImage);
+    }
+    self->checkedSrcCaps = TRUE;
+  }
+
+  if (self->isOutputDMAMemory) {
+    BufferEntry *entry = nullptr;
+    for (auto &e : self->outputBufferPool) {
+      if (!e->inUse) {
+        entry = e;
+        break;
+      }
+    }
+
+    if (!entry) {
+      BufferEntry *newEntry = new BufferEntry();
+      newEntry->buffer = new DRMBuffer(self->gbmManager);
+      if (newEntry->buffer->createBuffer(self->width, self->height,
+                                ARGB) < 0) {
+        GST_ERROR_OBJECT(self, "Failed to create DRM buffer");
+        delete newEntry->buffer;
+        delete newEntry;
+        return GST_FLOW_ERROR;
+      }
+      newEntry->inUse = TRUE;
+      self->outputBufferPool.push_back(newEntry);
+      entry = self->outputBufferPool.back();
+    } else {
+      entry->inUse = TRUE;
+    }
+
+    int fd = dup(entry->buffer->getSharedPlanes()[0].fd);
+    if (fd < 0) {
+      GST_ERROR_OBJECT(self, "Invalid DRM fd");
+      return GST_FLOW_ERROR;
+    }
+
+    guint outsize = GST_VIDEO_INFO_SIZE(&videoaggregator->info);
+
+    GstAllocator *dma_allocator = gst_dmabuf_allocator_new();
+    GstMemory *mem =
+        gst_dmabuf_allocator_alloc(GST_ALLOCATOR(dma_allocator), fd, outsize);
+    gst_object_unref(dma_allocator);
+
+    if (!mem) {
+      GST_ERROR_OBJECT(self, "Failed to allocate GstMemory from dma-buf fd");
+      return GST_FLOW_ERROR;
+    }
+
+    *outbuf = gst_buffer_new();
+    gst_buffer_append_memory(*outbuf, mem);
+
+    gst_mini_object_set_qdata(GST_MINI_OBJECT(*outbuf),
+                              g_quark_from_static_string("buffer_entry"), entry,
+                              nullptr);
+
+    gst_mini_object_weak_ref(
+        GST_MINI_OBJECT(*outbuf),
+        [](gpointer /*data*/, GstMiniObject *obj) {
+          BufferEntry *entry =
+              static_cast<BufferEntry *>(gst_mini_object_get_qdata(
+                  obj, g_quark_from_static_string("buffer_entry")));
+          if (entry) {
+            entry->inUse = FALSE;
+          }
+        },
+        nullptr);
+  } else
+    return GST_VIDEO_AGGREGATOR_CLASS(gst_synacompositor_parent_class)
+        ->create_output_buffer(videoaggregator, outbuf);
+
+  return GST_FLOW_OK;
 }
 
 static GstFlowReturn
@@ -522,41 +818,25 @@ gst_synacompositor_aggregate_frames(GstVideoAggregator *vagg,
                                     GstBuffer *outbuf) {
   GstSynaCompositor *self = GST_SYNACOMPOSITOR(vagg);
   GList *l;
-  guint i, n_pads = 0;
-  EGLImageKHR outputImage;
   guint renderingEnable = 0;
   int index = 0;
-  EGLImageKHR inputImage;
 
   if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
-    if (!eglMakeCurrent(self->eglManager.getDisplay(), EGL_NO_SURFACE,
-                        EGL_NO_SURFACE, self->eglManager.getContext())) {
+    if (!eglMakeCurrent(self->eglManager->getDisplay(), EGL_NO_SURFACE,
+                        EGL_NO_SURFACE, self->eglManager->getContext())) {
       EGLint error = eglGetError();
       GST_ERROR_OBJECT(self, "eglMakeCurrent failed! EGL error: 0x%04x\n",
                        error);
     }
   }
 
-  GST_OBJECT_LOCK(vagg);
+  GST_OBJECT_LOCK(self);
 
-  for (l = GST_ELEMENT(vagg)->sinkpads; l; l = l->next) {
-    GstVideoAggregatorPad *pad = (GstVideoAggregatorPad *)l->data;
-    GstVideoFrame *prepared_frame =
-        gst_video_aggregator_pad_get_prepared_frame(pad);
-    if (prepared_frame) {
-      GstVideoMeta *vmeta = gst_buffer_get_video_meta(prepared_frame->buffer);
-      GstMemory *mem = gst_buffer_peek_memory(prepared_frame->buffer, 0);
-      if (gst_is_dmabuf_memory(mem)) {
-        int fd1 = gst_dmabuf_memory_get_fd(mem);
-        mem = gst_buffer_peek_memory(prepared_frame->buffer, 1);
-        int fd2 = gst_dmabuf_memory_get_fd(mem);
-        self->eglManager.createImageKHR(fd1, fd2, inputImage, vmeta->width,
-                                        vmeta->height, NV12);
-        self->synaCompositor.setTextureImage(index, inputImage);
-        renderingEnable = 1;
-      } else
-        GST_DEBUG_OBJECT(self, "Buffer Format is not supported.");
-    }
+  for (l = GST_ELEMENT(self)->sinkpads; l; l = l->next) {
+    GstSynaCompositorPad *pad = (GstSynaCompositorPad *)l->data;
+    if (!(pad->received_eos))
+      self->synaCompositor->setTextureImage(index, pad->inputImage);
+    renderingEnable = 1;
     index++;
   }
 
@@ -565,15 +845,17 @@ gst_synacompositor_aggregate_frames(GstVideoAggregator *vagg,
     GstMemory *mem = gst_buffer_peek_memory(outbuf, 0);
     if (n_mem > 0) {
       if (gst_is_dmabuf_memory(mem)) {
-        int fd = gst_dmabuf_memory_get_fd(mem);
-        self->eglManager.createImageKHR(fd, -1, outputImage, 1920, 1080, ARGB);
-        self->synaCompositor.setOutputTextureImage(outputImage);
-        self->synaCompositor.startRendering();
+        EGLImageKHR image;
+        std::array <int32_t, GBM_MAX_PLANES> sharedFDs;
+        sharedFDs.fill(-1);
+        sharedFDs[0] = gst_dmabuf_memory_get_fd(mem);
+        self->eglManager->createImageKHR(sharedFDs, image, self->width,
+                                         self->height, ARGB, false);
+        self->synaCompositor->setOutputTextureImage(image);
+        self->synaCompositor->compositeFrame();
+        self->eglManager->destroyImageKHR(image);
       } else {
-        self->eglManager.createImageKHR(self->outputBuffer.getSharedFD(), -1,
-                                        outputImage, 1920, 1080, ARGB);
-        self->synaCompositor.setOutputTextureImage(outputImage);
-        self->synaCompositor.startRendering();
+        self->synaCompositor->compositeFrame();
 
         GstMapInfo map;
         if (!gst_buffer_map(outbuf, &map, GST_MAP_WRITE)) {
@@ -581,14 +863,14 @@ gst_synacompositor_aggregate_frames(GstVideoAggregator *vagg,
         }
 
         uint8_t *base = map.data;
-        memcpy_neon((void *)base, self->outputBuffer.getVirtualAddress(),
+        memcpy_neon((void *)base, self->outputBuffer->getSharedPlanes()[0].virtualAddress,
                     map.size);
         gst_buffer_unmap(outbuf, &map);
       }
     }
   }
 
-  GST_OBJECT_UNLOCK(vagg);
+  GST_OBJECT_UNLOCK(self);
 
   return GST_FLOW_OK;
 }
@@ -610,10 +892,13 @@ static void gst_synacompositor_class_init(GstSynaCompositorClass *klass) {
   gstelement_class->release_pad =
       GST_DEBUG_FUNCPTR(gst_synacompositor_release_pad);
   agg_class->sink_query = gst_synacompositor_sink_query;
+  agg_class->sink_event = gst_synacompositor_sink_event;
   agg_class->fixate_src_caps = gst_synacompositor_fixate_caps;
   agg_class->start = GST_DEBUG_FUNCPTR(gst_synacompositor_start);
   agg_class->stop = GST_DEBUG_FUNCPTR(gst_synacompositor_stop);
   videoaggregator_class->aggregate_frames = gst_synacompositor_aggregate_frames;
+  videoaggregator_class->create_output_buffer =
+      gst_synacompositor_create_output_buffer;
 
   gst_element_class_add_static_pad_template_with_gtype(
       gstelement_class, &src_factory, GST_TYPE_AGGREGATOR_PAD);
@@ -627,7 +912,7 @@ static void gst_synacompositor_class_init(GstSynaCompositorClass *klass) {
   g_object_class_install_property(
       gobject_class, PROP_BACKGROUND,
       g_param_spec_uint("background", "Background",
-                        "Background Color of Compositor (in ARGB hex value)",
+                        "Background Color of Compositor (in BGRA hex value)",
                         0x00000000, 0xFFFFFFFF, 0x00000000,
                         (GParamFlags)(G_PARAM_READWRITE |
                                       GST_PARAM_CONTROLLABLE |
@@ -644,6 +929,12 @@ static void gst_synacompositor_class_init(GstSynaCompositorClass *klass) {
           "height", "Height", "Height of the Compositor", 0.0, 2160.0, 0.0,
           (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_CONTROLLABLE |
                         G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      gobject_class, PROP_DRM_ADDRESS,
+      g_param_spec_string("drmdevice", "DRM Device",
+                          "Address of DRM Device (Ex. /dev/dri/card0)",
+                          "/dev/dri/card0",
+                          (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   gst_type_mark_as_plugin_api(GST_TYPE_SYNACOMPOSITOR_PAD,
                               (GstPluginAPIFlags)0);
@@ -652,8 +943,16 @@ static void gst_synacompositor_class_init(GstSynaCompositorClass *klass) {
 static void gst_synacompositor_init(GstSynaCompositor *self) {
   /* initialize variables to default values */
   self->background = 0x00000000;
-  self->height = 1080.0;
-  self->width = 1920.0;
+  self->height = 0.0;
+  self->width = 0.0;
+  self->gbmManager = nullptr;
+  self->synaCompositor = nullptr;
+  self->eglManager = nullptr;
+  self->outputBuffer = nullptr;
+  self->isOutputDMAMemory = FALSE;
+  self->checkedSrcCaps = FALSE;
+  self->numPads = 0;
+  self->outputBufferPool.clear();
 }
 
 /* GstChildProxy implementation */

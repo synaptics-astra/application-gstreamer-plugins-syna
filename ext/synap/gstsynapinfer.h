@@ -82,6 +82,8 @@ struct _GstSynapInfer
   Classifier *classifier;
   Detector *detector;
   vector<Detector::Result::Item> recognition_items;
+  vector<vector<Dim2d>> landmarks_2d_collection;
+  vector<Detector::Result::Item> detected_item_collection;
   InputData face_image;
 };
 
