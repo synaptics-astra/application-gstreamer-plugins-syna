@@ -53,11 +53,11 @@ typedef struct {
 
 typedef struct {
   GstMeta meta;
-  GArray *data;
-  GArray *tlx;
-  GArray *tly;
-  GArray *brx;
-  GArray *bry;
+  gpointer data;
+  gint tlx;
+  gint tly;
+  gint brx;
+  gint bry;
   gint width;
   gint height;
 } GstRecognitionMeta;
@@ -95,7 +95,7 @@ GstSynapMeta *gst_buffer_add_detector_synap_meta (GstBuffer * buffer,
     gint width, gint height);
 
 GstSynapMeta *gst_buffer_add_recognition_synap_meta (GstBuffer * buffer,
-    GstSynapPostProcessingMode mode, GArray* data, GArray* tlx, GArray* tly, GArray* brx, GArray* bry,
+    GstSynapPostProcessingMode mode, gpointer data, gint tlx, gint tly, gint brx, gint bry,
     gint width, gint height);
 
 gboolean gst_buffer_remove_synap_meta (GstBuffer * buffer);
