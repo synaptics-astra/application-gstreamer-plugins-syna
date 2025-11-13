@@ -1,5 +1,6 @@
 # Dependency
-synap_dep = dependency('synap-framework')
+synap_pkg = get_option('synap_dep')
+synap_dep = dependency(synap_pkg, required: true, method: 'pkg-config')
 cairo_dep = dependency('cairo-gobject', version : '>=1.10.0')
 opencv_dep = dependency('opencv4', version : '>=4.0.0')
 

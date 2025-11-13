@@ -3,3 +3,5 @@ option('examples', type : 'feature', value : 'auto', yield : true)
 option('tests', type : 'feature', value : 'auto', yield : true)
 option('nls', type : 'feature', value : 'auto', yield: true, description : 'Enable native language support (translations)')
 option('orc', type : 'feature', value : 'auto', yield : true)
+option('synap_dep', type: 'string', value: 'synap-framework',
+       description: 'Pkg-config module name for the Synap dependency')
