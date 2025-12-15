@@ -81,7 +81,14 @@ enum
   PROP_0,
   PROP_LABEL,
   PROP_RENDERCTRL_LOW_THRESHOLD,
-  PROP_RENDERCTRL_PERSISTENCE_FRAMES
+  PROP_RENDERCTRL_PERSISTENCE_FRAMES,
+  PROP_PREDICTIVE,
+  PROP_EMA_ALPHA,
+  PROP_EXTRAPOLATE_MAX_MS,
+  PROP_SMOOTH_VELOCITY,
+  PROP_VEL_ALPHA,
+  PROP_SMOOTH_DRAW,
+  PROP_DRAW_EMA_ALPHA
 };
 
 /* pad templates */
@@ -165,6 +172,40 @@ gst_synap_overlay_class_init (GstSynapOverlayClass * klass)
       g_param_spec_int ("persistenceframes", "PersistenceFrames", "Render control number of frames to persist", 0,
           G_MAXINT, 0,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  /* Prediction controls */
+  g_object_class_install_property (gobject_class, PROP_PREDICTIVE,
+      g_param_spec_boolean ("predictive", "PredictiveOverlay",
+          "Predict boxes forward to display PTS using constant-velocity model",
+          TRUE, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_EMA_ALPHA,
+      g_param_spec_double ("ema-alpha", "EMA Alpha",
+          "Residual EMA alpha (0..1) applied to predicted boxes",
+          0.0, 1.0, 0.5,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_EXTRAPOLATE_MAX_MS,
+      g_param_spec_int ("extrapolate-max-ms", "ExtrapolateMaxMilliseconds",
+          "Cap forward prediction to this many milliseconds (0 = unlimited)",
+          0, 2000, 250,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_SMOOTH_VELOCITY,
+      g_param_spec_boolean ("smooth-velocity", "SmoothVelocity",
+          "Low-pass the estimated box velocity (lag-minimizing smoothing)",
+          TRUE, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_VEL_ALPHA,
+      g_param_spec_double ("vel-alpha", "Velocity Alpha",
+          "EMA alpha (0..1) for velocity smoothing",
+          0.0, 1.0, 0.5,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_SMOOTH_DRAW,
+      g_param_spec_boolean ("smooth-draw", "SmoothDraw",
+          "EMA on predicted boxes to reduce visual flicker",
+          TRUE, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_DRAW_EMA_ALPHA,
+      g_param_spec_double ("draw-ema-alpha", "Draw EMA Alpha",
+          "EMA alpha (0..1) across drawn frames",
+          0.0, 1.0, 0.4,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
@@ -189,6 +230,22 @@ gst_synap_overlay_init (GstSynapOverlay * synapoverlay)
   strncpy(synapoverlay->icState.label, "", sizeof( synapoverlay->icState.label));
   synapoverlay->icState.confidence = 0.0;
   synapoverlay->icState.persistence_count = 0;
+  synapoverlay->predictive = TRUE;
+  synapoverlay->ema_alpha = 0.5;
+  synapoverlay->extrapolate_max_ms = 250;
+  synapoverlay->prev_det_copy = NULL;
+  synapoverlay->curr_det_copy = NULL;
+  synapoverlay->prev_det_pts = GST_CLOCK_TIME_NONE;
+  synapoverlay->curr_det_pts = GST_CLOCK_TIME_NONE;
+
+  /* Velocity smoothing defaults */
+  synapoverlay->smooth_velocity = TRUE;
+  synapoverlay->vel_alpha = 0.5;
+  synapoverlay->vel_state.clear();
+  synapoverlay->smooth_draw = FALSE;
+  synapoverlay->draw_ema_alpha = 0.3;
+  synapoverlay->last_draw_copy = NULL;
+  synapoverlay->last_draw_pts = GST_CLOCK_TIME_NONE;
 }
 
 void
@@ -220,6 +277,52 @@ gst_synap_overlay_set_property (GObject * object, guint property_id,
     {
       synapoverlay->renderctrlPersistenceFrames = g_value_get_int (value);
       GST_INFO ("Render Control Low Threshold: %d", synapoverlay->renderctrlPersistenceFrames);
+    }
+    break;
+
+    case PROP_PREDICTIVE:
+    {
+      synapoverlay->predictive = g_value_get_boolean (value);
+    }
+    break;
+
+    case PROP_EMA_ALPHA:
+    {
+      synapoverlay->ema_alpha = g_value_get_double (value);
+      GST_INFO ("EMA alpha: %f", synapoverlay->ema_alpha);
+    }
+    break;
+
+    case PROP_EXTRAPOLATE_MAX_MS:
+    {
+      synapoverlay->extrapolate_max_ms = g_value_get_int (value);
+      GST_INFO ("Extrapolate max ms: %d", synapoverlay->extrapolate_max_ms);
+    }
+    break;
+
+    case PROP_SMOOTH_VELOCITY:
+    {
+      synapoverlay->smooth_velocity = g_value_get_boolean (value);
+    }
+    break;
+
+    case PROP_VEL_ALPHA:
+    {
+      synapoverlay->vel_alpha = g_value_get_double (value);
+      GST_INFO ("Vel alpha: %f", synapoverlay->vel_alpha);
+    }
+    break;
+
+    case PROP_SMOOTH_DRAW:
+    {
+      synapoverlay->smooth_draw = g_value_get_boolean (value);
+    }
+    break;
+
+    case PROP_DRAW_EMA_ALPHA:
+    {
+      synapoverlay->draw_ema_alpha = g_value_get_double (value);
+      GST_INFO ("Draw EMA alpha: %f", synapoverlay->draw_ema_alpha);
     }
     break;
 
@@ -256,6 +359,48 @@ gst_synap_overlay_get_property (GObject * object, guint property_id,
     }
     break;
 
+    case PROP_PREDICTIVE:
+    {
+      g_value_set_boolean (value, synapoverlay->predictive);
+    }
+    break;
+
+    case PROP_EMA_ALPHA:
+    {
+      g_value_set_double (value, synapoverlay->ema_alpha);
+    }
+    break;
+
+    case PROP_EXTRAPOLATE_MAX_MS:
+    {
+      g_value_set_int (value, synapoverlay->extrapolate_max_ms);
+    }
+    break;
+
+    case PROP_SMOOTH_VELOCITY:
+    {
+      g_value_set_boolean (value, synapoverlay->smooth_velocity);
+    }
+    break;
+
+    case PROP_VEL_ALPHA:
+    {
+      g_value_set_double (value, synapoverlay->vel_alpha);
+    }
+    break;
+
+    case PROP_SMOOTH_DRAW:
+    {
+      g_value_set_boolean (value, synapoverlay->smooth_draw);
+    }
+    break;
+
+    case PROP_DRAW_EMA_ALPHA:
+    {
+      g_value_set_double (value, synapoverlay->draw_ema_alpha);
+    }
+    break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -268,6 +413,11 @@ gst_synap_overlay_dispose (GObject * object)
   GstSynapOverlay *synapoverlay = GST_SYNAP_OVERLAY (object);
 
   GST_DEBUG_OBJECT (synapoverlay, "dispose");
+
+  if (synapoverlay->prev_det_copy) { delete synapoverlay->prev_det_copy; synapoverlay->prev_det_copy = NULL; }
+  if (synapoverlay->curr_det_copy) { delete synapoverlay->curr_det_copy; synapoverlay->curr_det_copy = NULL; }
+  if (synapoverlay->last_draw_copy) { delete synapoverlay->last_draw_copy; synapoverlay->last_draw_copy = NULL; }
+  synapoverlay->vel_state.clear();
 
   /* clean up as possible.  may be called multiple times */
 
@@ -394,8 +544,14 @@ gst_synap_overlay_inference_sink_chain (GstPad * pad, GstObject * parent,
     if (meta->type.classifier.data != NULL)
       pushOverlayData (synapoverlay, meta, buffer->pts);
   } else if (meta->mode == GST_SYNAP_POSTPROCESSING_MODE_DETECTOR) {
-    if (meta->type.detector.data != NULL)
+    if (meta->type.detector.data != NULL) {
       pushOverlayData (synapoverlay, meta, buffer->pts);
+      synapoverlay->prev_det_pts = synapoverlay->curr_det_pts;
+      if (synapoverlay->prev_det_copy) { delete synapoverlay->prev_det_copy; synapoverlay->prev_det_copy = NULL; }
+      synapoverlay->prev_det_copy = synapoverlay->curr_det_copy;
+      synapoverlay->curr_det_pts = buffer->pts;
+      synapoverlay->curr_det_copy = new Detector::Result (*((Detector::Result*) meta->type.detector.data));
+    }
   } else {
     GST_ERROR ("Invalid mode - Should not reach here");
   }

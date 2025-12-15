@@ -76,6 +76,27 @@ struct _GstSynapOverlay
 
   /* SyNAP */
   LabelInfo *labelinfo;
+
+  /* Prediction state */
+  gboolean predictive;          /* enable prediction (default TRUE) */
+  gdouble  ema_alpha;           /* residual EMA (0..1) for stability */
+  gint     extrapolate_max_ms;  /* cap forward prediction, milliseconds */
+  Detector::Result *prev_det_copy; /* owned copy of previous detection */
+  Detector::Result *curr_det_copy; /* owned copy of latest detection   */
+  GstClockTime prev_det_pts;    /* PTS of previous detection */
+  GstClockTime curr_det_pts;    /* PTS of latest detection   */
+
+  /* Velocity-domain smoothing (no-lag) */
+  gboolean smooth_velocity;     /* enable low-pass on velocity */
+  gdouble  vel_alpha;           /* 0..1, weight for new velocity samples */
+  struct BoxVel { double vx, vy, vw, vh; int cls; };
+  std::vector<BoxVel> vel_state;/* smoothed velocity per current item */
+
+  /* Draw-level smoothing (EMA on what we actually draw) */
+  gboolean smooth_draw;         /* enable draw-level EMA (default TRUE) */
+  gdouble  draw_ema_alpha;      /* 0..1, how much of new vs. previous */
+  Detector::Result *last_draw_copy; /* last drawn result (owned copy) */
+  GstClockTime last_draw_pts;   /* PTS of last drawn result */
 };
 
 struct _GstSynapOverlayClass
