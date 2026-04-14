@@ -821,7 +821,7 @@ gst_synacompositor_aggregate_frames(GstVideoAggregator *vagg,
   guint renderingEnable = 0;
   int index = 0;
 
-  if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+  if (eglGetCurrentContext() != self->eglManager->getContext()) {
     if (!eglMakeCurrent(self->eglManager->getDisplay(), EGL_NO_SURFACE,
                         EGL_NO_SURFACE, self->eglManager->getContext())) {
       EGLint error = eglGetError();
