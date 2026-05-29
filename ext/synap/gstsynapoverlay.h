@@ -97,6 +97,10 @@ struct _GstSynapOverlay
   gdouble  draw_ema_alpha;      /* 0..1, how much of new vs. previous */
   Detector::Result *last_draw_copy; /* last drawn result (owned copy) */
   GstClockTime last_draw_pts;   /* PTS of last drawn result */
+
+  /* Segmentation masking */
+  gfloat segmentation_threshold; /* threshold for mask alpha */
+  gfloat segmentation_alpha;     /* alpha transparency */
 };
 
 struct _GstSynapOverlayClass

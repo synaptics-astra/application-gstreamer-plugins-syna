@@ -88,7 +88,9 @@ enum
   PROP_SMOOTH_VELOCITY,
   PROP_VEL_ALPHA,
   PROP_SMOOTH_DRAW,
-  PROP_DRAW_EMA_ALPHA
+  PROP_DRAW_EMA_ALPHA,
+  PROP_SEGMENTATION_THRESHOLD,
+  PROP_SEGMENTATION_ALPHA
 };
 
 /* pad templates */
@@ -206,6 +208,16 @@ gst_synap_overlay_class_init (GstSynapOverlayClass * klass)
           "EMA alpha (0..1) across drawn frames",
           0.0, 1.0, 0.4,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_SEGMENTATION_THRESHOLD,
+      g_param_spec_float ("segmentation-threshold", "Segmentation Threshold",
+          "Threshold for segmentation mask alpha",
+          0.0, 5.0, 2.0,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_SEGMENTATION_ALPHA,
+      g_param_spec_float ("segmentation-alpha", "Segmentation Alpha",
+          "Transparency (alpha) for segmentation masks",
+          0.0, 1.0, 0.3,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
@@ -246,6 +258,10 @@ gst_synap_overlay_init (GstSynapOverlay * synapoverlay)
   synapoverlay->draw_ema_alpha = 0.3;
   synapoverlay->last_draw_copy = NULL;
   synapoverlay->last_draw_pts = GST_CLOCK_TIME_NONE;
+
+  /* Segmentation masking defaults */
+  synapoverlay->segmentation_threshold = 2.0;
+  synapoverlay->segmentation_alpha = 0.3;
 }
 
 void
@@ -326,6 +342,20 @@ gst_synap_overlay_set_property (GObject * object, guint property_id,
     }
     break;
 
+    case PROP_SEGMENTATION_THRESHOLD:
+    {
+      synapoverlay->segmentation_threshold = g_value_get_float (value);
+      GST_INFO ("Segmentation threshold: %f", synapoverlay->segmentation_threshold);
+    }
+    break;
+
+    case PROP_SEGMENTATION_ALPHA:
+    {
+      synapoverlay->segmentation_alpha = g_value_get_float (value);
+      GST_INFO ("Segmentation alpha: %f", synapoverlay->segmentation_alpha);
+    }
+    break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -398,6 +428,18 @@ gst_synap_overlay_get_property (GObject * object, guint property_id,
     case PROP_DRAW_EMA_ALPHA:
     {
       g_value_set_double (value, synapoverlay->draw_ema_alpha);
+    }
+    break;
+
+    case PROP_SEGMENTATION_THRESHOLD:
+    {
+      g_value_set_float (value, synapoverlay->segmentation_threshold);
+    }
+    break;
+
+    case PROP_SEGMENTATION_ALPHA:
+    {
+      g_value_set_float (value, synapoverlay->segmentation_alpha);
     }
     break;
 

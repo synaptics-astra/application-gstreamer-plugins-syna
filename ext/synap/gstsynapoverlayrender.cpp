@@ -139,6 +139,106 @@ gst_synap_overlay_render_poseline (GstSynapOverlay *synapoverlay, GstVideoFrame 
   return TRUE;
 }
 
+static void
+gst_synap_overlay_get_class_color (int32_t class_index,
+    gdouble *r, gdouble *g, gdouble *b)
+{
+  static const gdouble palette[][3] = {
+    {1.0, 0.20, 0.20},
+    {0.20, 1.0, 0.20},
+    {0.20, 0.40, 1.0},
+    {1.0, 0.65, 0.20},
+    {0.70, 0.20, 1.0},
+    {0.20, 1.0, 0.85},
+    {1.0, 0.20, 0.75},
+    {0.95, 0.95, 0.20},
+  };
+
+  const size_t palette_size = sizeof (palette) / sizeof (palette[0]);
+  const size_t idx = (size_t) (((class_index % (int32_t) palette_size) +
+      (int32_t) palette_size) % (int32_t) palette_size);
+
+  *r = palette[idx][0];
+  *g = palette[idx][1];
+  *b = palette[idx][2];
+}
+
+static void
+gst_synap_overlay_render_segmentation_mask (GstSynapOverlay *synapoverlay,
+    GstVideoFrame *frame, cairo_t *cr, const Detector::Result::Item &item)
+{
+  if (!item.mask)
+    return;
+
+  const uint32_t mask_w = item.mask.width ();
+  const uint32_t mask_h = item.mask.height ();
+  if (mask_w == 0 || mask_h == 0)
+    return;
+
+  const std::vector<float> &mask = item.mask.buffer ();
+  if (mask.size () < (size_t) mask_w * (size_t) mask_h)
+    return;
+
+  const gdouble frame_w = GST_VIDEO_FRAME_WIDTH (frame);
+  const gdouble frame_h = GST_VIDEO_FRAME_HEIGHT (frame);
+  const gdouble det_w = synapoverlay->overlay_data.synapmeta.type.detector.width;
+  const gdouble det_h = synapoverlay->overlay_data.synapmeta.type.detector.height;
+
+  if (det_w <= 0.0 || det_h <= 0.0)
+    return;
+
+  const gdouble x = item.bounding_box.origin.x * frame_w / det_w;
+  const gdouble y = item.bounding_box.origin.y * frame_h / det_h;
+  const gdouble width = item.bounding_box.size.x * frame_w / det_w;
+  const gdouble height = item.bounding_box.size.y * frame_h / det_h;
+
+  if (width <= 0.0 || height <= 0.0)
+    return;
+
+  cairo_surface_t *alpha_surface =
+      cairo_image_surface_create (CAIRO_FORMAT_A8, (int) mask_w, (int) mask_h);
+  if (cairo_surface_status (alpha_surface) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy (alpha_surface);
+    return;
+  }
+
+  unsigned char *alpha_data = cairo_image_surface_get_data (alpha_surface);
+  const int alpha_stride = cairo_image_surface_get_stride (alpha_surface);
+
+  for (uint32_t my = 0; my < mask_h; ++my) {
+    unsigned char *row = alpha_data + (size_t) my * (size_t) alpha_stride;
+    for (uint32_t mx = 0; mx < mask_w; ++mx) {
+      const float m = mask[(size_t) my * (size_t) mask_w + mx];
+      row[mx] = (m >= synapoverlay->segmentation_threshold) ? 255 : 0;
+    }
+  }
+  cairo_surface_mark_dirty (alpha_surface);
+
+  cairo_save (cr);
+  cairo_rectangle (cr, x, y, width, height);
+  cairo_clip (cr);
+
+  gdouble r = 0.0;
+  gdouble g = 1.0;
+  gdouble b = 0.0;
+  gst_synap_overlay_get_class_color (item.class_index, &r, &g, &b);
+  cairo_set_source_rgba (cr, r, g, b, synapoverlay->segmentation_alpha);
+
+  cairo_pattern_t *mask_pattern = cairo_pattern_create_for_surface (alpha_surface);
+  cairo_pattern_set_filter (mask_pattern, CAIRO_FILTER_GOOD);
+  cairo_pattern_set_extend (mask_pattern, CAIRO_EXTEND_NONE);
+
+  cairo_matrix_t matrix;
+  cairo_matrix_init_scale (&matrix, (gdouble) mask_w / frame_w,
+      (gdouble) mask_h / frame_h);
+  cairo_pattern_set_matrix (mask_pattern, &matrix);
+  cairo_mask (cr, mask_pattern);
+
+  cairo_pattern_destroy (mask_pattern);
+  cairo_surface_destroy (alpha_surface);
+  cairo_restore (cr);
+}
+
 static gboolean
 gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
     GstBuffer * buffer, cairo_format_t format)
@@ -219,6 +319,9 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
       synapoverlay->vel_state.assign(curr.items.size(), {0,0,0,0,-1});
 
     for (size_t i = 0; i < curr.items.size(); ++i) {
+      if (curr.items[i].mask)
+        continue;
+
       /* Find best match in previous frame by IoU */
       int best = -1; double best_iou = IOU_T;
       for (size_t j = 0; j < prev.items.size(); ++j) {
@@ -310,6 +413,9 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
     std::vector<int> used(prevDraw.items.size(), 0);
 
     for (size_t i = 0; i < to_draw.items.size(); ++i) {
+      if (to_draw.items[i].mask)
+        continue;
+
       int best = -1; double best_iou = IOU_THRESH;
       for (size_t j = 0; j < prevDraw.items.size(); ++j) {
         if (used[j]) continue;
@@ -336,6 +442,9 @@ gst_synap_overlay_render_detection (GstSynapOverlay * synapoverlay,
   cairo_set_font_size (cr, 20.0);
 
   for (size_t i = 0; i < result->items.size (); i++) {
+    gst_synap_overlay_render_segmentation_mask (synapoverlay, &frame, cr,
+      result->items[i]);
+
     size_t points = result->items[i].landmarks.size();
     if (points == GST_SYNAP_POSE_SIZE) {
       cairo_set_source_rgb (cr, 1.0, 1.0, 0);
